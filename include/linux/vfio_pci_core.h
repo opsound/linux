@@ -148,6 +148,8 @@ struct vfio_pci_core_device {
 	struct vfio_pci_core_device	*sriov_pf_core_dev;
 	struct notifier_block	nb;
 	struct rw_semaphore	memory_lock;
+	struct rw_semaphore	dmabuf_lock;
+	bool			dmabufs_revoked;
 	struct list_head	dmabufs;
 };
 
