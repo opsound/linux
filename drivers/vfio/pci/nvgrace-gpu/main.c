@@ -9,6 +9,7 @@
 #include <linux/vfio_pci_core.h>
 #include <linux/delay.h>
 #include <linux/jiffies.h>
+#include <linux/pagemap.h>
 #include <linux/sched.h>
 #include <linux/pci-p2pdma.h>
 #include <linux/pm_runtime.h>
@@ -749,46 +750,30 @@ unlock:
  * Read the data from the device memory (mapped either through ioremap
  * or memremap) into the user buffer.
  */
-static int
-nvgrace_gpu_map_and_read(struct nvgrace_gpu_pci_core_device *nvdev,
-			 char __user *buf, size_t mem_count, loff_t *ppos)
+static int nvgrace_gpu_read_mapped(struct nvgrace_gpu_pci_core_device *nvdev,
+				   char __user *buf, size_t mem_count,
+				   loff_t *ppos)
 {
 	unsigned int index = VFIO_PCI_OFFSET_TO_INDEX(*ppos);
 	u64 offset = *ppos & VFIO_PCI_OFFSET_MASK;
-	int ret;
 
 	if (!mem_count)
 		return 0;
 
+	if (index == USEMEM_REGION_INDEX)
+		return copy_to_user(buf,
+				    (u8 *)nvdev->usemem.memaddr + offset,
+				    mem_count) ? -EFAULT : 0;
+
 	/*
-	 * Handle read on the BAR regions. Map to the target device memory
-	 * physical address and copy to the request read buffer.
+	 * The hardware ensures that the system does not crash when the device
+	 * memory is accessed with the memory enable turned off. It synthesizes
+	 * ~0 on such read, so pass test_mem as false.
 	 */
-	ret = nvgrace_gpu_map_device_mem(index, nvdev);
-	if (ret)
-		return ret;
-
-	if (index == USEMEM_REGION_INDEX) {
-		if (copy_to_user(buf,
-				 (u8 *)nvdev->usemem.memaddr + offset,
-				 mem_count))
-			ret = -EFAULT;
-	} else {
-		/*
-		 * The hardware ensures that the system does not crash when
-		 * the device memory is accessed with the memory enable
-		 * turned off. It synthesizes ~0 on such read. So there is
-		 * no need to check or support the disablement/enablement of
-		 * BAR through PCI_COMMAND config space register. Pass
-		 * test_mem flag as false.
-		 */
-		ret = vfio_pci_core_do_io_rw(&nvdev->core_device, false,
-					     nvdev->resmem.ioaddr,
-					     buf, offset, mem_count,
-					     0, 0, false, VFIO_PCI_IO_WIDTH_8);
-	}
-
-	return ret;
+	return vfio_pci_core_do_io_rw(&nvdev->core_device, false,
+				    nvdev->resmem.ioaddr, buf, offset,
+				    mem_count, 0, 0, false,
+				    VFIO_PCI_IO_WIDTH_8);
 }
 
 /*
@@ -831,6 +816,10 @@ nvgrace_gpu_read_mem(struct nvgrace_gpu_pci_core_device *nvdev,
 	else
 		mem_count = min(count, memregion->memlength - (size_t)offset);
 
+	/* Do not take memory_lock with a potentially faulting user buffer. */
+	if (fault_in_safe_writeable(buf, mem_count))
+		return -EFAULT;
+
 	if (nvdev->cxl_dvsec && READ_ONCE(nvdev->reset_done)) {
 		ret = nvgrace_gpu_wait_device_ready_cxl(nvdev);
 		if (ret)
@@ -842,7 +831,14 @@ nvgrace_gpu_read_mem(struct nvgrace_gpu_pci_core_device *nvdev,
 		if (ret)
 			return ret;
 
-		ret = nvgrace_gpu_map_and_read(nvdev, buf, mem_count, ppos);
+		ret = nvgrace_gpu_map_device_mem(index, nvdev);
+		if (ret)
+			return ret;
+
+		/* A concurrent unmap after prefaulting must fail, not fault. */
+		pagefault_disable();
+		ret = nvgrace_gpu_read_mapped(nvdev, buf, mem_count, ppos);
+		pagefault_enable();
 		if (ret)
 			return ret;
 	}
@@ -891,42 +887,29 @@ nvgrace_gpu_read(struct vfio_device *core_vdev,
  * Write the data to the device memory (mapped either through ioremap
  * or memremap) from the user buffer.
  */
-static int
-nvgrace_gpu_map_and_write(struct nvgrace_gpu_pci_core_device *nvdev,
-			  const char __user *buf, size_t mem_count,
-			  loff_t *ppos)
+static int nvgrace_gpu_write_mapped(struct nvgrace_gpu_pci_core_device *nvdev,
+				    const char __user *buf, size_t mem_count,
+				    loff_t *ppos)
 {
 	unsigned int index = VFIO_PCI_OFFSET_TO_INDEX(*ppos);
 	loff_t pos = *ppos & VFIO_PCI_OFFSET_MASK;
-	int ret;
 
 	if (!mem_count)
 		return 0;
 
-	ret = nvgrace_gpu_map_device_mem(index, nvdev);
-	if (ret)
-		return ret;
+	if (index == USEMEM_REGION_INDEX)
+		return copy_from_user((u8 *)nvdev->usemem.memaddr + pos,
+				      buf, mem_count) ? -EFAULT : 0;
 
-	if (index == USEMEM_REGION_INDEX) {
-		if (copy_from_user((u8 *)nvdev->usemem.memaddr + pos,
-				   buf, mem_count))
-			return -EFAULT;
-	} else {
-		/*
-		 * The hardware ensures that the system does not crash when
-		 * the device memory is accessed with the memory enable
-		 * turned off. It drops such writes. So there is no need to
-		 * check or support the disablement/enablement of BAR
-		 * through PCI_COMMAND config space register. Pass test_mem
-		 * flag as false.
-		 */
-		ret = vfio_pci_core_do_io_rw(&nvdev->core_device, false,
-					     nvdev->resmem.ioaddr,
-					     (char __user *)buf, pos, mem_count,
-					     0, 0, true, VFIO_PCI_IO_WIDTH_8);
-	}
-
-	return ret;
+	/*
+	 * The hardware ensures that the system does not crash when the device
+	 * memory is accessed with the memory enable turned off. It drops such
+	 * writes, so pass test_mem as false.
+	 */
+	return vfio_pci_core_do_io_rw(&nvdev->core_device, false,
+				    nvdev->resmem.ioaddr,
+				    (char __user *)buf, pos, mem_count,
+				    0, 0, true, VFIO_PCI_IO_WIDTH_8);
 }
 
 /*
@@ -971,6 +954,10 @@ nvgrace_gpu_write_mem(struct nvgrace_gpu_pci_core_device *nvdev,
 	 */
 	mem_count = min(count, memregion->memlength - (size_t)offset);
 
+	/* Do not take memory_lock with a potentially faulting user buffer. */
+	if (fault_in_readable(buf, mem_count))
+		return -EFAULT;
+
 	if (nvdev->cxl_dvsec && READ_ONCE(nvdev->reset_done)) {
 		ret = nvgrace_gpu_wait_device_ready_cxl(nvdev);
 		if (ret)
@@ -982,7 +969,14 @@ nvgrace_gpu_write_mem(struct nvgrace_gpu_pci_core_device *nvdev,
 		if (ret)
 			return ret;
 
-		ret = nvgrace_gpu_map_and_write(nvdev, buf, mem_count, ppos);
+		ret = nvgrace_gpu_map_device_mem(index, nvdev);
+		if (ret)
+			return ret;
+
+		/* A concurrent unmap after prefaulting must fail, not fault. */
+		pagefault_disable();
+		ret = nvgrace_gpu_write_mapped(nvdev, buf, mem_count, ppos);
+		pagefault_enable();
 		if (ret)
 			return ret;
 	}
