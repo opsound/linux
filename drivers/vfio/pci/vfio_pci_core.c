@@ -838,6 +838,10 @@ EXPORT_SYMBOL_GPL(vfio_pci_core_close_device);
 
 void vfio_pci_core_finish_enable(struct vfio_pci_core_device *vdev)
 {
+	down_write(&vdev->memory_lock);
+	vfio_pci_dma_buf_move(vdev, !__vfio_pci_memory_enabled(vdev));
+	up_write(&vdev->memory_lock);
+
 	vfio_pci_probe_mmaps(vdev);
 #if IS_ENABLED(CONFIG_EEH)
 	eeh_dev_open(vdev->pdev);
@@ -2195,6 +2199,8 @@ int vfio_pci_core_init_dev(struct vfio_device *core_vdev)
 		return ret;
 	INIT_LIST_HEAD(&vdev->dmabufs);
 	init_rwsem(&vdev->memory_lock);
+	init_rwsem(&vdev->dmabuf_lock);
+	vdev->dmabufs_revoked = true;
 	xa_init(&vdev->ctx);
 
 	return 0;
