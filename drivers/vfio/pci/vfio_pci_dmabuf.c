@@ -10,6 +10,11 @@
 
 MODULE_IMPORT_NS("DMA_BUF");
 
+/* QEMU-only test hook; never intended for submission. */
+static bool vfio_pci_test_export_memory_lock;
+module_param_named(test_export_memory_lock,
+		   vfio_pci_test_export_memory_lock, bool, 0644);
+
 #ifdef CONFIG_VFIO_PCI_DMABUF
 static int vfio_pci_dma_buf_attach(struct dma_buf *dmabuf,
 				   struct dma_buf_attachment *attachment)
@@ -307,6 +312,7 @@ static int vfio_pci_dmabuf_export(struct vfio_pci_core_device *vdev,
 				  struct vfio_pci_dma_buf *priv, u32 flags)
 {
 	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
+	bool test_memory_lock = READ_ONCE(vfio_pci_test_export_memory_lock);
 
 	if (!vfio_device_try_get_registration(&vdev->vdev))
 		return -ENODEV;
@@ -336,13 +342,21 @@ static int vfio_pci_dmabuf_export(struct vfio_pci_core_device *vdev,
 	 *
 	 * dmabuf_lock -> resv
 	 */
+	if (test_memory_lock)
+		down_read(&vdev->memory_lock);
 	down_write(&vdev->dmabuf_lock);
 	dma_resv_lock(priv->dmabuf->resv, NULL);
-	priv->status = vdev->dmabufs_revoked ? VFIO_PCI_DMABUF_TEMP_REVOKED :
-		VFIO_PCI_DMABUF_OK;
+	if (test_memory_lock)
+		priv->status = __vfio_pci_memory_enabled(vdev) ?
+			VFIO_PCI_DMABUF_OK : VFIO_PCI_DMABUF_TEMP_REVOKED;
+	else
+		priv->status = vdev->dmabufs_revoked ?
+			VFIO_PCI_DMABUF_TEMP_REVOKED : VFIO_PCI_DMABUF_OK;
 	list_add_tail(&priv->dmabufs_elm, &vdev->dmabufs);
 	dma_resv_unlock(priv->dmabuf->resv);
 	up_write(&vdev->dmabuf_lock);
+	if (test_memory_lock)
+		up_read(&vdev->memory_lock);
 
 	return 0;
 }
