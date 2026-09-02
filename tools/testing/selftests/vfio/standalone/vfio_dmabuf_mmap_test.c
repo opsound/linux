@@ -47,6 +47,7 @@
 #include <linux/vfio.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -163,7 +164,7 @@ static int vfio_setup(int groupnr, char *rid_str,
 	/* Regions are BAR0-5 then ROM, config, VGA */
 	int out_region = 0;
 
-	for (int i = 0; i < device_info.num_regions; i++) {
+	for (uint32_t i = 0; i < device_info.num_regions; i++) {
 		struct vfio_region_info reg = { .argsz = sizeof(reg) };
 
 		reg.index = i;
@@ -279,37 +280,13 @@ static int vfio_create_dmabuf_dual(int dev_fd, uint32_t region,
 	return ioctl(dev_fd, VFIO_DEVICE_FEATURE, &ftrbuf);
 }
 
-static int vfio_set_dmabuf_memattr(int dev_fd, int dmabuf_fd, uint32_t attr)
-{
-	uint64_t ftrbuf
-		[ROUND_UP(sizeof(struct vfio_device_feature) +
-				  sizeof(struct vfio_device_feature_dma_buf_memattr),
-			  8) /
-		 8];
-
-	struct vfio_device_feature *f = (struct vfio_device_feature *)ftrbuf;
-	struct vfio_device_feature_dma_buf_memattr *dbm =
-		(struct vfio_device_feature_dma_buf_memattr *)f->data;
-
-	f->argsz = sizeof(ftrbuf);
-	f->flags = VFIO_DEVICE_FEATURE_SET | VFIO_DEVICE_FEATURE_DMA_BUF_MEMATTR;
-	dbm->dmabuf_fd = dmabuf_fd;
-	dbm->memattr = attr;
-
-	int ret = ioctl(dev_fd, VFIO_DEVICE_FEATURE, &ftrbuf);
-	if (ret < 0)
-		return ret;
-
-	return dbm->memattr;
-}
-
 static volatile uint32_t *mmap_resource_aligned(size_t size,
 						unsigned long align, int fd,
 						unsigned long offset)
 {
 	void *v;
 
-	if (align <= getpagesize()) {
+	if (align <= (unsigned long)getpagesize()) {
 		v = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
 			 offset);
 		FAIL_IF(v == MAP_FAILED,
@@ -484,17 +461,7 @@ static int vfio_dmabuf_test_membar(int dev_fd, unsigned long long membar_region_
 
 	FAIL_IF(membar_db_fd < 0, "Can't create DMABUF, %d\n", errno);
 
-	if (!vfio_feature_present(dev_fd, VFIO_DEVICE_FEATURE_DMA_BUF_MEMATTR)) {
-		printf("-W- VFIO DMABUF memattr support not available\n");
-	} else {
-		int r;
-		/* Set WC */
-		r = vfio_set_dmabuf_memattr(dev_fd, membar_db_fd,
-					    VFIO_DEVICE_FEATURE_DMA_BUF_MEMATTR_WC);
-		FAIL_IF(r < 0, "GET DMABUF_MEMATTR failed; %d\n", r);
-		printf("-i- Set DMABUF_MEMATTR to WC (%d)\n", r);
-		/* Assume it worked.  There isn't a get to verify with. */
-	}
+	/* v6 no longer carries the experimental MEMATTR UAPI. */
 
 	volatile uint32_t *db_membar = mmap_resource_aligned(
 		membar_region_size, MiB(32), membar_db_fd, 0);
