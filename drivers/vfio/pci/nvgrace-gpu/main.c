@@ -10,6 +10,7 @@
 #include <linux/delay.h>
 #include <linux/jiffies.h>
 #include <linux/sched.h>
+#include <linux/slab.h>
 #include <linux/pci-p2pdma.h>
 #include <linux/pm_runtime.h>
 #include <linux/memory-failure.h>
@@ -39,6 +40,7 @@
 
 #define POLL_QUANTUM_MS 1000
 #define POLL_TIMEOUT_MS (30 * 1000)
+#define NVGRACE_GPU_RW_MAX SZ_4K
 
 /*
  * The state of the two device memory region - resmem and usemem - is
@@ -749,31 +751,18 @@ unlock:
  * Read the data from the device memory (mapped either through ioremap
  * or memremap) into the user buffer.
  */
-static int
-nvgrace_gpu_map_and_read(struct nvgrace_gpu_pci_core_device *nvdev,
-			 char __user *buf, size_t mem_count, loff_t *ppos)
+static void nvgrace_gpu_read_mapped(struct nvgrace_gpu_pci_core_device *nvdev,
+				    void *buf, size_t mem_count, loff_t *ppos)
 {
 	unsigned int index = VFIO_PCI_OFFSET_TO_INDEX(*ppos);
 	u64 offset = *ppos & VFIO_PCI_OFFSET_MASK;
-	int ret;
 
 	if (!mem_count)
-		return 0;
+		return;
 
-	/*
-	 * Handle read on the BAR regions. Map to the target device memory
-	 * physical address and copy to the request read buffer.
-	 */
-	ret = nvgrace_gpu_map_device_mem(index, nvdev);
-	if (ret)
-		return ret;
-
-	if (index == USEMEM_REGION_INDEX) {
-		if (copy_to_user(buf,
-				 (u8 *)nvdev->usemem.memaddr + offset,
-				 mem_count))
-			ret = -EFAULT;
-	} else {
+	if (index == USEMEM_REGION_INDEX)
+		memcpy(buf, (u8 *)nvdev->usemem.memaddr + offset, mem_count);
+	else
 		/*
 		 * The hardware ensures that the system does not crash when
 		 * the device memory is accessed with the memory enable
@@ -782,13 +771,7 @@ nvgrace_gpu_map_and_read(struct nvgrace_gpu_pci_core_device *nvdev,
 		 * BAR through PCI_COMMAND config space register. Pass
 		 * test_mem flag as false.
 		 */
-		ret = vfio_pci_core_do_io_rw(&nvdev->core_device, false,
-					     nvdev->resmem.ioaddr,
-					     buf, offset, mem_count,
-					     0, 0, false, VFIO_PCI_IO_WIDTH_8);
-	}
-
-	return ret;
+		memcpy_fromio(buf, nvdev->resmem.ioaddr + offset, mem_count);
 }
 
 /*
@@ -808,8 +791,9 @@ nvgrace_gpu_read_mem(struct nvgrace_gpu_pci_core_device *nvdev,
 	u64 offset = *ppos & VFIO_PCI_OFFSET_MASK;
 	unsigned int index = VFIO_PCI_OFFSET_TO_INDEX(*ppos);
 	struct mem_region *memregion;
-	size_t mem_count, i;
-	u8 val = 0xFF;
+	size_t mem_count;
+	u64 stack_buf;
+	void *kbuf = &stack_buf;
 	int ret;
 
 	/* No need to do NULL check as caller does. */
@@ -818,8 +802,11 @@ nvgrace_gpu_read_mem(struct nvgrace_gpu_pci_core_device *nvdev,
 	if (offset >= memregion->bar_size)
 		return -EINVAL;
 
-	/* Clip short the read request beyond reported BAR size */
-	count = min(count, memregion->bar_size - (size_t)offset);
+	/* Bound temporary storage and let userspace retry a short read. */
+	count = min3(count, memregion->bar_size - (size_t)offset,
+		     (size_t)NVGRACE_GPU_RW_MAX);
+	if (!count)
+		return 0;
 
 	/*
 	 * Determine how many bytes to be actually read from the device memory.
@@ -831,35 +818,43 @@ nvgrace_gpu_read_mem(struct nvgrace_gpu_pci_core_device *nvdev,
 	else
 		mem_count = min(count, memregion->memlength - (size_t)offset);
 
+	if (count > sizeof(stack_buf)) {
+		kbuf = kmalloc(count, GFP_KERNEL);
+		if (!kbuf)
+			return -ENOMEM;
+	}
+	memset((u8 *)kbuf + mem_count, 0xff, count - mem_count);
+
 	if (nvdev->cxl_dvsec && READ_ONCE(nvdev->reset_done)) {
 		ret = nvgrace_gpu_wait_device_ready_cxl(nvdev);
 		if (ret)
-			return ret;
+			goto out_free;
 	}
 
 	scoped_guard(rwsem_read, &vdev->memory_lock) {
 		ret = nvgrace_gpu_check_device_ready(nvdev);
 		if (ret)
-			return ret;
+			goto out_free;
 
-		ret = nvgrace_gpu_map_and_read(nvdev, buf, mem_count, ppos);
+		ret = nvgrace_gpu_map_device_mem(index, nvdev);
 		if (ret)
-			return ret;
+			goto out_free;
+
+		nvgrace_gpu_read_mapped(nvdev, kbuf, mem_count, ppos);
 	}
 
-	/*
-	 * Only the device memory present on the hardware is mapped, which may
-	 * not be power-of-2 aligned. A read to an offset beyond the device memory
-	 * size is filled with ~0.
-	 */
-	for (i = mem_count; i < count; i++) {
-		ret = put_user(val, (unsigned char __user *)(buf + i));
-		if (ret)
-			return ret;
+	if (copy_to_user(buf, kbuf, count)) {
+		ret = -EFAULT;
+		goto out_free;
 	}
 
 	*ppos += count;
-	return count;
+	ret = count;
+
+out_free:
+	if (kbuf != &stack_buf)
+		kfree(kbuf);
+	return ret;
 }
 
 static ssize_t
@@ -891,27 +886,19 @@ nvgrace_gpu_read(struct vfio_device *core_vdev,
  * Write the data to the device memory (mapped either through ioremap
  * or memremap) from the user buffer.
  */
-static int
-nvgrace_gpu_map_and_write(struct nvgrace_gpu_pci_core_device *nvdev,
-			  const char __user *buf, size_t mem_count,
-			  loff_t *ppos)
+static void nvgrace_gpu_write_mapped(struct nvgrace_gpu_pci_core_device *nvdev,
+				     const void *buf, size_t mem_count,
+				     loff_t *ppos)
 {
 	unsigned int index = VFIO_PCI_OFFSET_TO_INDEX(*ppos);
 	loff_t pos = *ppos & VFIO_PCI_OFFSET_MASK;
-	int ret;
 
 	if (!mem_count)
-		return 0;
+		return;
 
-	ret = nvgrace_gpu_map_device_mem(index, nvdev);
-	if (ret)
-		return ret;
-
-	if (index == USEMEM_REGION_INDEX) {
-		if (copy_from_user((u8 *)nvdev->usemem.memaddr + pos,
-				   buf, mem_count))
-			return -EFAULT;
-	} else {
+	if (index == USEMEM_REGION_INDEX)
+		memcpy((u8 *)nvdev->usemem.memaddr + pos, buf, mem_count);
+	else
 		/*
 		 * The hardware ensures that the system does not crash when
 		 * the device memory is accessed with the memory enable
@@ -920,13 +907,7 @@ nvgrace_gpu_map_and_write(struct nvgrace_gpu_pci_core_device *nvdev,
 		 * through PCI_COMMAND config space register. Pass test_mem
 		 * flag as false.
 		 */
-		ret = vfio_pci_core_do_io_rw(&nvdev->core_device, false,
-					     nvdev->resmem.ioaddr,
-					     (char __user *)buf, pos, mem_count,
-					     0, 0, true, VFIO_PCI_IO_WIDTH_8);
-	}
-
-	return ret;
+		memcpy_toio(nvdev->resmem.ioaddr + pos, buf, mem_count);
 }
 
 /*
@@ -946,7 +927,9 @@ nvgrace_gpu_write_mem(struct nvgrace_gpu_pci_core_device *nvdev,
 	u64 offset = *ppos & VFIO_PCI_OFFSET_MASK;
 	struct mem_region *memregion;
 	size_t mem_count;
-	int ret = 0;
+	u64 stack_buf;
+	void *kbuf = &stack_buf;
+	int ret;
 
 	/* No need to do NULL check as caller does. */
 	memregion = nvgrace_gpu_memregion(index, nvdev);
@@ -954,8 +937,11 @@ nvgrace_gpu_write_mem(struct nvgrace_gpu_pci_core_device *nvdev,
 	if (offset >= memregion->bar_size)
 		return -EINVAL;
 
-	/* Clip short the write request beyond reported BAR size */
-	count = min(count, memregion->bar_size - (size_t)offset);
+	/* Bound temporary storage and let userspace retry a short write. */
+	count = min3(count, memregion->bar_size - (size_t)offset,
+		     (size_t)NVGRACE_GPU_RW_MAX);
+	if (!count)
+		return 0;
 
 	/*
 	 * Determine how many bytes to be actually written to the device memory.
@@ -971,25 +957,42 @@ nvgrace_gpu_write_mem(struct nvgrace_gpu_pci_core_device *nvdev,
 	 */
 	mem_count = min(count, memregion->memlength - (size_t)offset);
 
+	if (mem_count > sizeof(stack_buf)) {
+		kbuf = kmalloc(mem_count, GFP_KERNEL);
+		if (!kbuf)
+			return -ENOMEM;
+	}
+	if (copy_from_user(kbuf, buf, mem_count)) {
+		ret = -EFAULT;
+		goto out_free;
+	}
+
 	if (nvdev->cxl_dvsec && READ_ONCE(nvdev->reset_done)) {
 		ret = nvgrace_gpu_wait_device_ready_cxl(nvdev);
 		if (ret)
-			return ret;
+			goto out_free;
 	}
 
 	scoped_guard(rwsem_read, &vdev->memory_lock) {
 		ret = nvgrace_gpu_check_device_ready(nvdev);
 		if (ret)
-			return ret;
+			goto out_free;
 
-		ret = nvgrace_gpu_map_and_write(nvdev, buf, mem_count, ppos);
+		ret = nvgrace_gpu_map_device_mem(index, nvdev);
 		if (ret)
-			return ret;
+			goto out_free;
+
+		nvgrace_gpu_write_mapped(nvdev, kbuf, mem_count, ppos);
 	}
 
 exitfn:
 	*ppos += count;
-	return count;
+	ret = count;
+
+out_free:
+	if (kbuf != &stack_buf)
+		kfree(kbuf);
+	return ret;
 }
 
 static ssize_t
