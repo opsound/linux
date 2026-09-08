@@ -91,12 +91,24 @@ struct group_device {
 #define for_each_group_device(group, pos) \
 	list_for_each_entry(pos, &(group)->devices, list)
 
+/*
+ * group->devices membership is stable under group->mutex.  Device reset
+ * paths traverse it while holding only group->reset_mutex, which the
+ * add/remove paths below also hold (nested under group->mutex, the same
+ * order iommu_attach_device_pasid() uses), so accept either lock here.
+ */
+static void iommu_group_devices_assert(struct iommu_group *group)
+{
+	lockdep_assert(lockdep_is_held(&group->mutex) != LOCK_STATE_NOT_HELD ||
+		       lockdep_is_held(&group->reset_mutex) != LOCK_STATE_NOT_HELD);
+}
+
 static struct group_device *__dev_to_gdev(struct device *dev)
 {
 	struct iommu_group *group = dev->iommu_group;
 	struct group_device *gdev;
 
-	lockdep_assert_held(&group->mutex);
+	iommu_group_devices_assert(group);
 
 	for_each_group_device(group, gdev) {
 		if (gdev->dev == dev)
@@ -755,6 +767,7 @@ static void __iommu_group_remove_device(struct device *dev)
 	struct group_device *device;
 
 	mutex_lock(&group->mutex);
+	mutex_lock(&group->reset_mutex);
 	for_each_group_device(group, device) {
 		if (device->dev != dev)
 			continue;
@@ -767,6 +780,7 @@ static void __iommu_group_remove_device(struct device *dev)
 			dev->iommu_group = NULL;
 		break;
 	}
+	mutex_unlock(&group->reset_mutex);
 	mutex_unlock(&group->mutex);
 
 	/*
@@ -1340,7 +1354,9 @@ int iommu_group_add_device(struct iommu_group *group, struct device *dev)
 	dev->iommu_group = group;
 
 	mutex_lock(&group->mutex);
+	mutex_lock(&group->reset_mutex);
 	list_add_tail(&gdev->list, &group->devices);
+	mutex_unlock(&group->reset_mutex);
 	mutex_unlock(&group->mutex);
 	return 0;
 }
@@ -1387,7 +1403,7 @@ EXPORT_SYMBOL_GPL(iommu_group_mutex_assert);
 
 static struct device *iommu_group_first_dev(struct iommu_group *group)
 {
-	lockdep_assert_held(&group->mutex);
+	iommu_group_devices_assert(group);
 	return list_first_entry(&group->devices, struct group_device, list)->dev;
 }
 
@@ -4117,7 +4133,7 @@ static bool group_device_dma_alias_is_blocked(struct iommu_group *group,
 {
 	struct group_device *sibling;
 
-	lockdep_assert_held(&group->mutex);
+	iommu_group_devices_assert(group);
 
 	if (!dev_is_pci(gdev->dev))
 		return false;
