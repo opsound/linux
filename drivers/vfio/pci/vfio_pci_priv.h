@@ -36,12 +36,19 @@ struct vfio_pci_dma_buf {
 	size_t size;
 	struct phys_vec *phys_vec;
 	struct p2pdma_provider *provider;
-	struct file *vfile;
 	u32 nr_ranges;
 	struct kref kref;
 	struct completion comp;
 	unsigned long vma_pgoff_adjust;
 	enum vfio_pci_dma_buf_status status;
+	/*
+	 * True for DMABUFs implicitly created for a VFIO BAR mmap():
+	 * such VMAs keep the VFIO device file (not the DMABUF file),
+	 * so each VMA holds a DMABUF file reference managed by the
+	 * vm_ops open()/close() hooks.  Explicitly exported DMABUFs
+	 * have vm_file == dmabuf file and don't need this.
+	 */
+	bool vma_holds_dmabuf;
 };
 
 bool vfio_pci_intx_mask(struct vfio_pci_core_device *vdev);

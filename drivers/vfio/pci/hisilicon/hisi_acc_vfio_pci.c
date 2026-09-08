@@ -1579,13 +1579,6 @@ static int hisi_acc_vfio_pci_migrn_init_dev(struct vfio_device *core_vdev)
 	ret = vfio_pci_core_init_dev(core_vdev);
 	if (ret)
 		return ret;
-	/*
-	 * hisi_acc_vfio_pci_mmap() calls down to
-	 * vfio_pci_core_mmap(), so BAR mappings are still
-	 * DMABUF-backed.  They don't require a zap on revoke, so opt
-	 * out:
-	 */
-	hisi_acc_vdev->core_device.zap_bars_on_revoke = false;
 
 	return 0;
 }

@@ -140,8 +140,6 @@ static void vfio_pci_dma_buf_release(struct dma_buf *dmabuf)
 		up_write(&priv->vdev->dmabuf_lock);
 		vfio_device_put_registration(&priv->vdev->vdev);
 	}
-	if (priv->vfile)
-		fput(priv->vfile);
 	kfree(priv->phys_vec);
 	kfree(priv);
 }
@@ -381,7 +379,6 @@ int vfio_pci_core_mmap_prep_dmabuf(struct vfio_pci_core_device *vdev,
 {
 	struct vfio_pci_dma_buf *priv;
 	unsigned long vma_pgoff = vma->vm_pgoff & (VFIO_PCI_OFFSET_MASK >> PAGE_SHIFT);
-	char *bufname;
 	int ret;
 
 	priv = kzalloc_obj(*priv);
@@ -392,20 +389,6 @@ int vfio_pci_core_mmap_prep_dmabuf(struct vfio_pci_core_device *vdev,
 	if (!priv->phys_vec) {
 		ret = -ENOMEM;
 		goto err_free_priv;
-	}
-
-	/*
-	 * Maximum size of the friendly debug name is
-	 * vfio1048575:ffff:ff:1f.7/5 = 26.  This fits within
-	 * DMA_BUF_NAME_LEN, so dma_buf_set_name() below won't fail.
-	 */
-	bufname = kasprintf(GFP_KERNEL, "%s:%s/%x",
-			    dev_name(&vdev->vdev.device), pci_name(vdev->pdev),
-			    res_index);
-
-	if (!bufname) {
-		ret = -ENOMEM;
-		goto err_free_phys;
 	}
 
 	/*
@@ -434,7 +417,7 @@ int vfio_pci_core_mmap_prep_dmabuf(struct vfio_pci_core_device *vdev,
 	priv->provider = pcim_p2pdma_provider(vdev->pdev, res_index);
 	if (IS_ENABLED(CONFIG_VFIO_PCI_DMABUF) && !priv->provider) {
 		ret = -EINVAL;
-		goto err_free_name;
+		goto err_free_phys;
 	}
 
 	priv->phys_vec[0].paddr = phys_start + ((u64)vma_pgoff << PAGE_SHIFT);
@@ -442,33 +425,27 @@ int vfio_pci_core_mmap_prep_dmabuf(struct vfio_pci_core_device *vdev,
 
 	ret = vfio_pci_dmabuf_export(vdev, priv, O_RDWR);
 	if (ret)
-		goto err_free_name;
-
-	if (dma_buf_set_name(priv->dmabuf, bufname)) {
-		/* Shouldn't happen, but don't leak if it does: */
-		dev_dbg_ratelimited(&vdev->pdev->dev,
-				    "Failed to set map name '%s'\n",
-				    bufname);
-		kfree(bufname);
-	}
+		goto err_free_phys;
 
 	/*
-	 * Ownership of the DMABUF file transfers to the VMA so that
-	 * other users can locate the DMABUF via a VA.  Ownership of
-	 * the original VFIO device file being mmap()ed transfers to
-	 * priv, and is put when the DMABUF is released.  This
-	 * intentionally does not use get_file()/vma_set_file()
-	 * because the references are already held, and ownership
-	 * moves.
+	 * The VMA keeps the VFIO device file; it is deliberately NOT
+	 * exchanged for the DMABUF file.  That preserves the VMA's
+	 * identity for LSM checks (mmap and mprotect are both
+	 * evaluated against the VFIO device node) and for
+	 * /proc/<pid>/maps, lsof, etc.
+	 *
+	 * Instead, the export's initial DMABUF file reference is owned
+	 * by this VMA; vm_ops open()/close() take and drop references
+	 * for VMA copies (fork, split, mremap), so the DMABUF outlives
+	 * all its VMAs.  The VMA's own reference to the VFIO device
+	 * file keeps the device open, as before DMABUF-backed BAR
+	 * mappings.
 	 */
-	priv->vfile = vma->vm_file;
-	vma->vm_file = priv->dmabuf->file;
+	priv->vma_holds_dmabuf = true;
 	vma->vm_private_data = priv;
 
 	return 0;
 
-err_free_name:
-	kfree(bufname);
 err_free_phys:
 	kfree(priv->phys_vec);
 err_free_priv:

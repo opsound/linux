@@ -1719,23 +1719,26 @@ EXPORT_SYMBOL_GPL(vfio_pci_core_write);
 
 static void vfio_pci_revoke_bars(struct vfio_pci_core_device *vdev)
 {
+	struct vfio_device *core_vdev = &vdev->vdev;
+	loff_t start = VFIO_PCI_INDEX_TO_OFFSET(VFIO_PCI_BAR0_REGION_INDEX);
+	loff_t end = VFIO_PCI_INDEX_TO_OFFSET(VFIO_PCI_ROM_REGION_INDEX);
+	loff_t len = end - start;
+
 	lockdep_assert_held_write(&vdev->memory_lock);
 	vfio_pci_dma_buf_move(vdev, true);
 
 	/*
-	 * If a driver could possibly create BAR mappings in the
-	 * vdev's address_space, do an additional zap on revoke.  See
-	 * vfio_pci_core_init_dev().
+	 * BAR mappings established through vfio_pci_core_mmap() keep
+	 * the VFIO device file in the VMA, so their PTEs live in the
+	 * device's address_space and are zapped here.  Mappings of
+	 * explicitly exported DMABUFs live in per-buffer address
+	 * spaces and were zapped per-buffer above.  Variant drivers
+	 * with .mmap overrides are covered by the same zap;
+	 * over-zapping is safe because every fault handler
+	 * revalidates before inserting a PFN.
 	 */
-	if (vdev->zap_bars_on_revoke) {
-		struct vfio_device *core_vdev = &vdev->vdev;
-		loff_t start = VFIO_PCI_INDEX_TO_OFFSET(VFIO_PCI_BAR0_REGION_INDEX);
-		loff_t end = VFIO_PCI_INDEX_TO_OFFSET(VFIO_PCI_ROM_REGION_INDEX);
-		loff_t len = end - start;
-
-		unmap_mapping_range(core_vdev->inode->i_mapping,
-				    start, len, true);
-	}
+	unmap_mapping_range(core_vdev->inode->i_mapping,
+			    start, len, true);
 }
 
 void vfio_pci_lock_revoke_bars(struct vfio_pci_core_device *vdev)
@@ -1802,16 +1805,17 @@ static vm_fault_t vfio_pci_mmap_huge_fault(struct vm_fault *vmf,
 	vm_fault_t ret = VM_FAULT_SIGBUS;
 
 	/*
-	 * The only thing this can rely on is that the DMABUF relating
-	 * to the VMA's vm_file exists (priv).
+	 * The only thing this can rely on is that the DMABUF (priv)
+	 * itself exists: a BAR-map VMA holds a DMABUF file reference
+	 * (managed by vm_ops open/close), while a VMA of an
+	 * explicitly-exported DMABUF holds it via vm_file.
 	 *
-	 * A DMABUF for a VFIO device fd mmap() holds a reference to
-	 * the original VFIO device fd, but an explicitly-exported
-	 * DMABUF does not.  The original fd might have closed,
-	 * meaning this fault can race with
-	 * vfio_pci_dma_buf_cleanup(), meaning the buffer could have
-	 * been revoked (in which case priv->vdev might be NULL), and
-	 * the VFIO device registration might have been dropped.
+	 * A BAR-map VMA also holds the VFIO device file, but an
+	 * explicitly-exported DMABUF does not.  In the latter case the
+	 * original fd might have closed, meaning this fault can race
+	 * with vfio_pci_dma_buf_cleanup(), meaning the buffer could
+	 * have been revoked (in which case priv->vdev might be NULL),
+	 * and the VFIO device registration might have been dropped.
 	 *
 	 * With the goal of taking vdev locks in a world where vdev
 	 * might not still exist:
@@ -1904,7 +1908,31 @@ static vm_fault_t vfio_pci_mmap_page_fault(struct vm_fault *vmf)
 	return vfio_pci_mmap_huge_fault(vmf, 0);
 }
 
+static void vfio_pci_mmap_open(struct vm_area_struct *vma)
+{
+	struct vfio_pci_dma_buf *priv = vma->vm_private_data;
+
+	/*
+	 * A new VMA copy (fork, split, mremap) referring to a BAR-map
+	 * DMABUF takes its own DMABUF file reference.  VMAs of
+	 * explicitly exported DMABUFs already reference the DMABUF via
+	 * vm_file, so they skip this.
+	 */
+	if (priv->vma_holds_dmabuf)
+		get_file(priv->dmabuf->file);
+}
+
+static void vfio_pci_mmap_close(struct vm_area_struct *vma)
+{
+	struct vfio_pci_dma_buf *priv = vma->vm_private_data;
+
+	if (priv->vma_holds_dmabuf)
+		fput(priv->dmabuf->file);
+}
+
 static const struct vm_operations_struct vfio_pci_mmap_ops = {
+	.open = vfio_pci_mmap_open,
+	.close = vfio_pci_mmap_close,
 	.fault = vfio_pci_mmap_page_fault,
 #ifdef CONFIG_ARCH_SUPPORTS_HUGE_PFNMAP
 	.huge_fault = vfio_pci_mmap_huge_fault,
@@ -2308,16 +2336,6 @@ int vfio_pci_core_init_dev(struct vfio_device *core_vdev)
 	init_rwsem(&vdev->memory_lock);
 	init_rwsem(&vdev->dmabuf_lock);
 	xa_init(&vdev->ctx);
-
-	/*
-	 * If a driver overrides .mmap, it has to be assumed that it
-	 * might not use the DMABUF-backed core mmap; this flag
-	 * enables a zap at revoke time.  A driver can opt out by
-	 * clearing this flag at init, if their .mmap override calls
-	 * down to vfio_pci_core_mmap().
-	 */
-	if (vdev->vdev.ops->mmap != vfio_pci_core_mmap)
-		vdev->zap_bars_on_revoke = true;
 
 	return 0;
 }
