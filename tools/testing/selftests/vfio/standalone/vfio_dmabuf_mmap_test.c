@@ -47,6 +47,7 @@
 #include <linux/vfio.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -163,7 +164,7 @@ static int vfio_setup(int groupnr, char *rid_str,
 	/* Regions are BAR0-5 then ROM, config, VGA */
 	int out_region = 0;
 
-	for (int i = 0; i < device_info.num_regions; i++) {
+	for (uint32_t i = 0; i < device_info.num_regions; i++) {
 		struct vfio_region_info reg = { .argsz = sizeof(reg) };
 
 		reg.index = i;
@@ -285,7 +286,7 @@ static volatile uint32_t *mmap_resource_aligned(size_t size,
 {
 	void *v;
 
-	if (align <= getpagesize()) {
+	if (align <= (unsigned long)getpagesize()) {
 		v = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
 			 offset);
 		FAIL_IF(v == MAP_FAILED,
