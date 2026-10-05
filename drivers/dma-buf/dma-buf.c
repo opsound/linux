@@ -193,10 +193,26 @@ static void dma_buf_release(struct dentry *dentry)
 
 static int dma_buf_file_release(struct inode *inode, struct file *file)
 {
+	struct dma_buf *dmabuf = file->private_data;
+
 	if (!is_dma_buf_file(file))
 		return -EINVAL;
 
-	__dma_buf_list_del(file->private_data);
+	__dma_buf_list_del(dmabuf);
+	if (!dmabuf)
+		return 0;
+
+	/*
+	 * Clear dmabuf->file once the file is freed.  The DMABUF itself
+	 * outlives the file while its dentry is held open (e.g. O_PATH),
+	 * and exporters that walk their own lists must not dereference
+	 * the stale pointer.  Pairs with the fully ordered file_ref_get()
+	 * and reload in __get_file_rcu(): once this file's slot can have
+	 * been reused, get_file_active(&dmabuf->file) must see NULL.
+	 * Full barrier, since the refcount drop precedes ->release and
+	 * nothing else orders this store before the slab free.
+	 */
+	smp_store_mb(dmabuf->file, NULL);
 
 	return 0;
 }

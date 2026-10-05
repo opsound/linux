@@ -747,12 +747,15 @@ void vfio_pci_dma_buf_move(struct vfio_pci_core_device *vdev, bool revoked)
 	down_write(&vdev->dmabuf_lock);
 	vdev->bars_revoked = revoked;
 	list_for_each_entry_safe(priv, tmp, &vdev->dmabufs, dmabufs_elm) {
-		if (!get_file_active(&priv->dmabuf->file))
+		struct file *file;
+
+		file = get_file_active(&priv->dmabuf->file);
+		if (!file)
 			continue;
 		vfio_pci_dma_buf_set_status(priv, revoked ?
 					    VFIO_PCI_DMABUF_REVOKED :
 					    VFIO_PCI_DMABUF_OK);
-		fput(priv->dmabuf->file);
+		fput(file);
 	}
 	up_write(&vdev->dmabuf_lock);
 }
@@ -775,13 +778,16 @@ void vfio_pci_dma_buf_cleanup(struct vfio_pci_core_device *vdev)
 
 	down_write(&vdev->dmabuf_lock);
 	list_for_each_entry_safe(priv, tmp, &vdev->dmabufs, dmabufs_elm) {
-		if (!get_file_active(&priv->dmabuf->file))
+		struct file *file;
+
+		file = get_file_active(&priv->dmabuf->file);
+		if (!file)
 			continue;
 
 		list_del_init(&priv->dmabufs_elm);
 		WRITE_ONCE(priv->vdev, NULL);
 		vfio_device_put_registration(&vdev->vdev);
-		fput(priv->dmabuf->file);
+		fput(file);
 	}
 	up_write(&vdev->dmabuf_lock);
 	up_write(&vdev->memory_lock);
