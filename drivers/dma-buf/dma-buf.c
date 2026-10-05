@@ -73,9 +73,6 @@ static void __dma_buf_list_add(struct dma_buf *dmabuf)
 
 static void __dma_buf_list_del(struct dma_buf *dmabuf)
 {
-	if (!dmabuf)
-		return;
-
 	mutex_lock(&dmabuf_list_mutex);
 	list_del(&dmabuf->list_node);
 	mutex_unlock(&dmabuf_list_mutex);
@@ -171,6 +168,26 @@ static void dma_buf_release(struct dentry *dentry)
 	if (unlikely(!dmabuf))
 		return;
 
+	/*
+	 * The dentry can outlive the file, e.g. while an O_PATH fd holds it.
+	 * Only dmabuffs_dname() reaches the dma_buf after the file is
+	 * released, so only what it reads is freed here.
+	 */
+	kfree(dmabuf->name);
+	kfree(dmabuf);
+}
+
+static int dma_buf_file_release(struct inode *inode, struct file *file)
+{
+	struct dma_buf *dmabuf = file->private_data;
+
+	if (!is_dma_buf_file(file))
+		return -EINVAL;
+	if (!dmabuf)
+		return 0;
+
+	__dma_buf_list_del(dmabuf);
+
 	BUG_ON(dmabuf->vmapping_counter);
 
 	/*
@@ -187,16 +204,6 @@ static void dma_buf_release(struct dentry *dentry)
 
 	WARN_ON(!list_empty(&dmabuf->attachments));
 	module_put(dmabuf->owner);
-	kfree(dmabuf->name);
-	kfree(dmabuf);
-}
-
-static int dma_buf_file_release(struct inode *inode, struct file *file)
-{
-	if (!is_dma_buf_file(file))
-		return -EINVAL;
-
-	__dma_buf_list_del(file->private_data);
 
 	return 0;
 }
