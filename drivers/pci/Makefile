@@ -51,3 +51,9 @@ subdir-ccflags-$(CONFIG_PCI_DEBUG) := -DDEBUG
 
 CFLAGS_trace.o := -I$(src)
 obj-$(CONFIG_TRACING)		+= trace.o
+
+# TEST ONLY (pciehp-reset-lab)
+obj-y += pcitest_hooks.o
+
+# TEST ONLY (pciehp-reset-lab)
+CFLAGS_pcitest_hooks.o += -DPCITEST_KNOB_ADD_DELAY

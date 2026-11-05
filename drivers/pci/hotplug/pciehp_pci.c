@@ -21,6 +21,8 @@
 #include "../pci.h"
 #include "pciehp.h"
 
+void pciehp_test_delay(struct controller *ctrl, bool post);	/* TEST ONLY (pciehp-reset-lab) */
+
 /**
  * pciehp_configure_device() - enumerate PCI devices below a hotplug bridge
  * @ctrl: PCIe hotplug controller
@@ -51,6 +53,7 @@ int pciehp_configure_device(struct controller *ctrl)
 		goto out;
 	}
 
+	pciehp_test_delay(ctrl, false);	/* TEST ONLY (pciehp-reset-lab) */
 	num = pci_scan_slot(parent, PCI_DEVFN(0, 0));
 	if (num == 0) {
 		ctrl_err(ctrl, "No new device found\n");
@@ -63,6 +66,7 @@ int pciehp_configure_device(struct controller *ctrl)
 
 	pci_assign_unassigned_bridge_resources(bridge);
 	pcie_bus_configure_settings(parent);
+	pciehp_test_delay(ctrl, true);	/* TEST ONLY (pciehp-reset-lab) */
 
 	/*
 	 * Release reset_lock during driver binding
