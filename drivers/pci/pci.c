@@ -5614,6 +5614,52 @@ static int pci_reset_devs_trylock(struct pci_reset_devs *rd)
 	return 1;
 }
 
+/*
+ * Whether @bus or @slot gained devices that the current task didn't lock,
+ * e.g. while it waited for device locks.  Devices whose removal began
+ * don't count.
+ */
+static bool __pci_bus_lock_changed(struct pci_bus *bus, struct pci_slot *slot)
+{
+	struct pci_dev *dev;
+
+	list_for_each_entry(dev, &bus->devices, bus_list) {
+		if ((slot && dev->slot != slot) || pci_dev_is_removed(dev))
+			continue;
+		if (!pci_bus_dev_locked(dev))
+			return true;
+		if (dev->subordinate &&
+		    __pci_bus_lock_changed(dev->subordinate, NULL))
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Return: 1 if @bus or @slot changed, 0 if not, -EBUSY if it couldn't be
+ * checked: don't block on pci_bus_sem with device locks held, a writer may
+ * be queued behind a reader which waits for one of them.
+ */
+static int pci_bus_lock_changed(struct pci_bus *bus, struct pci_slot *slot)
+{
+	int ret;
+
+	if (!down_read_trylock(&pci_bus_sem))
+		return -EBUSY;
+	ret = __pci_bus_lock_changed(bus, slot);
+	up_read(&pci_bus_sem);
+
+	return ret;
+}
+
+/*
+ * Bound the retries of a reset whose bus or slot changes under it, and give
+ * devices that are being added time to finish.
+ */
+#define PCI_RESET_TRIES		20
+#define PCI_RESET_RETRY_MS	10
+
 static void pci_reset_devs_release(struct pci_reset_devs *rd)
 {
 	pci_reset_devs_unlock(rd, rd->nr);
@@ -5622,33 +5668,62 @@ static void pci_reset_devs_release(struct pci_reset_devs *rd)
 
 /*
  * Snapshot and lock the bridge above @bus and the devices on and below
- * @bus, or in @slot.  Devices added while the reset waits for a lock are
- * left alone.
+ * @bus, or in @slot.  Relock if devices were added meanwhile, so that the
+ * reset locks and saves them too.  Once the tries run out, a try reset
+ * fails, while one that has to happen, e.g. for error recovery, goes
+ * ahead, also if the last check couldn't be made because pci_bus_sem was
+ * contended.  The callers keep @slot allocated.
  *
  * Return: the locked snapshot, or ERR_PTR(-EAGAIN) if @try and a device is
- * locked, -ENODEV if the bridge is being removed, -ENOMEM.
+ * locked or keeps being added, -ENODEV if the bridge is being removed,
+ * -ENOMEM.
  */
 static struct pci_reset_devs *pci_reset_devs_acquire(struct pci_bus *bus,
 						     struct pci_slot *slot,
 						     bool try)
 {
 	struct pci_reset_devs *rd;
+	int changed, tries = 0;
 
-	rd = pci_reset_devs_get(bus, slot);
-	if (!rd)
-		return ERR_PTR(-ENOMEM);
+	/* Nothing else keeps @bus allocated while no device is locked */
+	pci_bus_get(bus);
+	for (;;) {
+		rd = pci_reset_devs_get(bus, slot);
+		if (!rd) {
+			rd = ERR_PTR(-ENOMEM);
+			break;
+		}
 
-	if (!try) {
-		pci_reset_devs_lock(rd);
-	} else if (!pci_reset_devs_trylock(rd)) {
-		pci_reset_devs_put(rd);
-		return ERR_PTR(-EAGAIN);
-	}
+		if (!try) {
+			pci_reset_devs_lock(rd);
+		} else if (!pci_reset_devs_trylock(rd)) {
+			pci_reset_devs_put(rd);
+			rd = ERR_PTR(-EAGAIN);
+			break;
+		}
 
-	if (rd->dev[0] && !pci_bus_dev_locked(rd->dev[0])) {
+		if (rd->dev[0] && !pci_bus_dev_locked(rd->dev[0])) {
+			pci_reset_devs_release(rd);
+			rd = ERR_PTR(-ENODEV);
+			break;
+		}
+
+		changed = pci_bus_lock_changed(bus, slot);
+		if (!changed)
+			break;
+		if (++tries >= PCI_RESET_TRIES) {
+			/* All devices in the snapshot are locked */
+			if (!try)
+				break;
+			pci_reset_devs_release(rd);
+			rd = ERR_PTR(-EAGAIN);
+			break;
+		}
+
 		pci_reset_devs_release(rd);
-		return ERR_PTR(-ENODEV);
+		msleep(PCI_RESET_RETRY_MS);
 	}
+	pci_bus_put(bus);
 
 	return rd;
 }
@@ -5773,7 +5848,8 @@ static int pci_bus_reset(struct pci_bus *bus, bool probe)
 
 	might_sleep();
 
-	ret = pci_bridge_secondary_bus_reset(bus->self);
+	/* The snapshot pins the bridge, but not @bus */
+	ret = pci_bridge_secondary_bus_reset(rd->dev[0]);
 
 	pci_reset_devs_release(rd);
 
@@ -5801,7 +5877,7 @@ static int pci_try_reset_bus(struct pci_bus *bus)
 
 	pci_reset_devs_save(rd);
 	might_sleep();
-	rc = pci_bridge_secondary_bus_reset(bus->self);
+	rc = pci_bridge_secondary_bus_reset(rd->dev[0]);
 	pci_reset_devs_restore(rd, "bus reset");
 	pci_reset_devs_release(rd);
 
@@ -5907,8 +5983,26 @@ EXPORT_SYMBOL_GPL(pci_probe_reset_bus);
  */
 int pci_reset_bus(struct pci_dev *pdev)
 {
-	return (!pci_probe_reset_slot(pdev->slot)) ?
-	    pci_try_reset_slot(pdev->slot) : pci_try_reset_bus(pdev->bus);
+	struct pci_slot *slot;
+	int rc;
+
+	/* Pin the slot, pci_try_reset_slot() sleeps between retries */
+	mutex_lock(&pci_slot_mutex);
+	slot = pdev->slot;
+	if (slot)
+		kobject_get(&slot->kobj);
+	mutex_unlock(&pci_slot_mutex);
+
+	rc = (!pci_probe_reset_slot(slot)) ?
+	    pci_try_reset_slot(slot) : pci_try_reset_bus(pdev->bus);
+
+	if (slot) {
+		/* The final put unlinks the slot, which needs pci_slot_mutex */
+		mutex_lock(&pci_slot_mutex);
+		kobject_put(&slot->kobj);
+		mutex_unlock(&pci_slot_mutex);
+	}
+	return rc;
 }
 EXPORT_SYMBOL_GPL(pci_reset_bus);
 
