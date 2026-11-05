@@ -125,6 +125,7 @@ extern bool pci_early_dump;
 
 extern struct mutex pci_rescan_remove_lock;
 int pci_rescan_remove_trylock(void);
+bool pci_lock_rescan_remove_unless_removing(struct pci_dev *dev);
 
 void pci_slot_unset_hotplug(struct pci_slot *slot);
 bool pci_slot_lock_outdated(struct pci_slot *slot, bool binding);
@@ -865,6 +866,8 @@ static inline void pci_dev_allow_binding(struct pci_dev *dev)
 {
 	set_bit(PCI_DEV_ALLOW_BINDING, &dev->priv_flags);
 }
+
+void pci_dev_disallow_binding(struct pci_dev *dev);
 
 static inline bool pci_dev_binding_disallowed(struct pci_dev *dev)
 {

@@ -3525,6 +3525,7 @@ EXPORT_SYMBOL_GPL(pci_rescan_bus);
  * routines should always be executed under this mutex.
  */
 DEFINE_MUTEX(pci_rescan_remove_lock);
+static DECLARE_WAIT_QUEUE_HEAD(pci_rescan_remove_wq);
 
 void pci_lock_rescan_remove(void)
 {
@@ -3541,8 +3542,45 @@ int pci_rescan_remove_trylock(void)
 void pci_unlock_rescan_remove(void)
 {
 	mutex_unlock(&pci_rescan_remove_lock);
+	wake_up_all(&pci_rescan_remove_wq);
 }
 EXPORT_SYMBOL_GPL(pci_unlock_rescan_remove);
+
+/**
+ * pci_lock_rescan_remove_unless_removing - acquire pci_rescan_remove_lock
+ *	unless a device is being removed
+ * @dev: device whose removal ends the wait
+ *
+ * Wait until pci_rescan_remove_lock is acquired or the removal of @dev has
+ * begun, which also removes everything below @dev.  For hotplug drivers
+ * whose port's removal waits for the task that waits for the lock, e.g. in
+ * free_irq(), while the holder of the lock may wait for the port.
+ *
+ * Return: true if the lock was acquired.
+ */
+bool pci_lock_rescan_remove_unless_removing(struct pci_dev *dev)
+{
+	bool locked = false;
+
+	might_lock(&pci_rescan_remove_lock);
+	wait_event(pci_rescan_remove_wq,
+		   pci_dev_binding_disallowed(dev) ||
+		   (locked = pci_rescan_remove_trylock()));
+
+	return locked;
+}
+
+/**
+ * pci_dev_disallow_binding - prevent drivers from binding to a device
+ * @dev: the device, whose removal begins
+ *
+ * Also end the waits of pci_lock_rescan_remove_unless_removing() for @dev.
+ */
+void pci_dev_disallow_binding(struct pci_dev *dev)
+{
+	clear_bit(PCI_DEV_ALLOW_BINDING, &dev->priv_flags);
+	wake_up_all(&pci_rescan_remove_wq);
+}
 
 static int __init pci_sort_bf_cmp(const struct device *d_a,
 				  const struct device *d_b)

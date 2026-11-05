@@ -27,8 +27,8 @@
  *
  * Enumerate PCI devices below a hotplug bridge and add them to the system.
  * Return 0 on success, %-EEXIST if the devices are already enumerated,
- * %-ENODEV if enumeration failed or %-EAGAIN if the slot was reset since
- * the caller checked the link.
+ * %-ENODEV if enumeration failed or removal of the hotplug bridge began, or
+ * %-EAGAIN if the slot was reset since the caller checked the link.
  *
  * Context: Called with @ctrl->reset_lock held for reading.  Releases it
  * during driver binding and while waiting for pci_rescan_remove_lock.
@@ -48,6 +48,9 @@ int pciehp_configure_device(struct controller *ctrl)
 	 * check, so have it redo the check.
 	 */
 	while (!pci_rescan_remove_trylock()) {
+		/* The port's remover may hold the lock and wait for this thread */
+		if (pci_dev_binding_disallowed(bridge))
+			return -ENODEV;
 		up_read(&ctrl->reset_lock);
 		pci_lock_rescan_remove();
 		pci_unlock_rescan_remove();
@@ -111,8 +114,9 @@ int pciehp_configure_device(struct controller *ctrl)
  *	false for surprise removal
  *
  * Unbind PCI devices below a hotplug bridge from their drivers and remove
- * them from the system.  Safely removed devices are quiesced.  Surprise
- * removed devices are marked as such to prevent further accesses.
+ * them from the system, unless the bridge itself is being removed.  Safely
+ * removed devices are quiesced.  Surprise removed devices are marked as such
+ * to prevent further accesses.
  *
  * Context: Called with @ctrl->reset_lock held for reading.  Releases it
  * while removing the devices.
@@ -140,7 +144,16 @@ void pciehp_unconfigure_device(struct controller *ctrl, bool presence)
 	if (!presence)
 		pci_walk_bus(parent, pci_dev_set_disconnected, NULL);
 
-	pci_lock_rescan_remove();
+	/*
+	 * Removing the hotplug bridge waits for this IRQ thread in
+	 * pcie_shutdown_notification(), while the remover may hold the lock,
+	 * or the lock's holder may wait for the remover, e.g. for the bridge's
+	 * device_lock in pci_reset_devs_lock().  So stop waiting once removal
+	 * of the bridge has begun.  Everything below it is removed along with
+	 * it.
+	 */
+	if (!pci_lock_rescan_remove_unless_removing(ctrl->pcie->port))
+		goto out;
 
 	/*
 	 * Stopping an SR-IOV PF device removes all the associated VFs,
@@ -167,5 +180,6 @@ void pciehp_unconfigure_device(struct controller *ctrl, bool presence)
 	}
 
 	pci_unlock_rescan_remove();
+out:
 	down_read_nested(&ctrl->reset_lock, ctrl->depth);
 }

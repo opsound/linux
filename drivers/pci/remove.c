@@ -24,6 +24,7 @@ static void pci_stop_dev(struct pci_dev *dev)
 	if (!pci_dev_test_and_clear_added(dev))
 		return;
 
+	pci_dev_disallow_binding(dev);
 	device_release_driver(&dev->dev);
 	pci_proc_detach_device(dev);
 	of_pci_remove_node(dev);
