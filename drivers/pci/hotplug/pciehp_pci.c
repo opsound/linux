@@ -64,17 +64,20 @@ int pciehp_configure_device(struct controller *ctrl)
 	pci_assign_unassigned_bridge_resources(bridge);
 	pcie_bus_configure_settings(parent);
 
+	dev = pci_get_slot(parent, PCI_DEVFN(0, 0));
+	ctrl->dsn = dev ? pci_get_dsn(dev) : 0;
+	pci_dev_put(dev);
+
 	/*
-	 * Release reset_lock during driver binding
-	 * to avoid AB-BA deadlock with device_lock.
+	 * Release reset_lock during driver binding to avoid AB-BA deadlock
+	 * with device_lock.  Re-acquire it only after releasing
+	 * pci_rescan_remove_lock, which is acquired with reset_lock held.
 	 */
 	up_read(&ctrl->reset_lock);
 	pci_bus_add_devices(parent);
+	pci_unlock_rescan_remove();
 	down_read_nested(&ctrl->reset_lock, ctrl->depth);
-
-	dev = pci_get_slot(parent, PCI_DEVFN(0, 0));
-	ctrl->dsn = pci_get_dsn(dev);
-	pci_dev_put(dev);
+	return 0;
 
  out:
 	pci_unlock_rescan_remove();
