@@ -91,6 +91,9 @@ int pciehp_configure_device(struct controller *ctrl)
  * Unbind PCI devices below a hotplug bridge from their drivers and remove
  * them from the system.  Safely removed devices are quiesced.  Surprise
  * removed devices are marked as such to prevent further accesses.
+ *
+ * Context: Called with @ctrl->reset_lock held for reading.  Releases it
+ * while removing the devices.
  */
 void pciehp_unconfigure_device(struct controller *ctrl, bool presence)
 {
@@ -100,6 +103,17 @@ void pciehp_unconfigure_device(struct controller *ctrl, bool presence)
 
 	ctrl_dbg(ctrl, "%s: domain:bus:dev = %04x:%02x:00\n",
 		 __func__, pci_domain_nr(parent), parent->number);
+
+	/*
+	 * Bringing down the slot does not depend on link or presence state,
+	 * so reset_lock is not needed:  Driver unbinding is serialized with
+	 * resets by device_lock, and a removed device can only be hit by a
+	 * Secondary Bus Reset, which leaves Bus Master disabled anyway.
+	 * Don't wait for pci_bus_sem or pci_rescan_remove_lock with reset_lock
+	 * held, as their holders may wait for a reset of this slot, e.g. by
+	 * user space.
+	 */
+	up_read(&ctrl->reset_lock);
 
 	if (!presence)
 		pci_walk_bus(parent, pci_dev_set_disconnected, NULL);
@@ -115,14 +129,7 @@ void pciehp_unconfigure_device(struct controller *ctrl, bool presence)
 	list_for_each_entry_safe_reverse(dev, temp, &parent->devices,
 					 bus_list) {
 		pci_dev_get(dev);
-
-		/*
-		 * Release reset_lock during driver unbinding
-		 * to avoid AB-BA deadlock with device_lock.
-		 */
-		up_read(&ctrl->reset_lock);
 		pci_stop_and_remove_bus_device(dev);
-		down_read_nested(&ctrl->reset_lock, ctrl->depth);
 
 		/*
 		 * Ensure that no new Requests will be generated from
@@ -138,4 +145,5 @@ void pciehp_unconfigure_device(struct controller *ctrl, bool presence)
 	}
 
 	pci_unlock_rescan_remove();
+	down_read_nested(&ctrl->reset_lock, ctrl->depth);
 }
