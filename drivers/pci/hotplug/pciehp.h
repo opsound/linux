@@ -82,6 +82,8 @@ extern int pciehp_poll_time;
  *	used as lock subclass for @reset_lock
  * @reset_count: number of slot resets, incremented with @reset_lock held
  *	for writing
+ * @binding: drivers are being bound to the devices enumerated in the slot,
+ *	with @reset_lock released; written with @reset_lock held for reading
  * @ist_running: flag to keep user request waiting while IRQ thread is running
  * @request_result: result of last user request submitted to the IRQ thread
  * @requester: wait queue to wake up on completion of user request,
@@ -116,6 +118,7 @@ struct controller {
 	struct rw_semaphore reset_lock;
 	unsigned int depth;
 	unsigned int reset_count;
+	bool binding;
 	unsigned int ist_running;
 	int request_result;
 	wait_queue_head_t requester;

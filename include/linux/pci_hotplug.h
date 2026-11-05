@@ -29,6 +29,9 @@
  * @reset_slot: Optional interface to allow override of a bus reset for the
  *	slot for cases where a secondary bus reset can result in spurious
  *	hotplug events or where a slot can be reset independent of the bus.
+ *	Return -EAGAIN without resetting to have the caller relock the slot
+ *	and retry, e.g. if the slot was enumerated meanwhile (see
+ *	pci_slot_lock_outdated()).
  *
  * The table of function pointers that is passed to the hotplug pci core by a
  * hotplug pci driver.  These functions are called by the hotplug pci core when

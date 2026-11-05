@@ -88,12 +88,14 @@ int pciehp_configure_device(struct controller *ctrl)
 
 	/*
 	 * Release reset_lock during driver binding to avoid AB-BA deadlock
-	 * with device_lock.
+	 * with device_lock.  Slot resets meanwhile back off.
 	 */
+	ctrl->binding = true;
 	up_read(&ctrl->reset_lock);
 	pci_bus_add_devices(parent);
 	pci_unlock_rescan_remove();
 	down_read_nested(&ctrl->reset_lock, ctrl->depth);
+	ctrl->binding = false;
 	return 0;
 
  out:

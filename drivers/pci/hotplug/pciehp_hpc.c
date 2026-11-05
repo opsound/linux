@@ -985,6 +985,18 @@ int pciehp_reset_slot(struct hotplug_slot *hotplug_slot, bool probe)
 		return 0;
 
 	down_write_nested(&ctrl->reset_lock, ctrl->depth);
+
+	/*
+	 * pciehp enumerates the slot with reset_lock held for reading and
+	 * releases it to bind drivers, so the slot may have gained devices
+	 * after the caller locked it.  Don't reset devices that the caller
+	 * hasn't locked and saved, or whose drivers are binding.
+	 */
+	if (pci_slot_lock_outdated(hotplug_slot->pci_slot, ctrl->binding)) {
+		up_write(&ctrl->reset_lock);
+		return -EAGAIN;
+	}
+
 	ctrl->reset_count++;
 
 	pci_hp_ignore_link_change(pdev);

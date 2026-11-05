@@ -5616,20 +5616,22 @@ static int pci_reset_devs_trylock(struct pci_reset_devs *rd)
 
 /*
  * Whether @bus or @slot gained devices that the current task didn't lock,
- * e.g. while it waited for device locks.  Devices whose removal began
- * don't count.
+ * e.g. while it waited for device locks, or, if @added, has devices that
+ * pci_bus_add_device() isn't done with, or that are being stopped.  Devices
+ * whose removal began don't count.
  */
-static bool __pci_bus_lock_changed(struct pci_bus *bus, struct pci_slot *slot)
+static bool __pci_bus_lock_changed(struct pci_bus *bus, struct pci_slot *slot,
+				   bool added)
 {
 	struct pci_dev *dev;
 
 	list_for_each_entry(dev, &bus->devices, bus_list) {
 		if ((slot && dev->slot != slot) || pci_dev_is_removed(dev))
 			continue;
-		if (!pci_bus_dev_locked(dev))
+		if (!pci_bus_dev_locked(dev) || (added && !pci_dev_is_added(dev)))
 			return true;
 		if (dev->subordinate &&
-		    __pci_bus_lock_changed(dev->subordinate, NULL))
+		    __pci_bus_lock_changed(dev->subordinate, NULL, added))
 			return true;
 	}
 
@@ -5641,16 +5643,47 @@ static bool __pci_bus_lock_changed(struct pci_bus *bus, struct pci_slot *slot)
  * checked: don't block on pci_bus_sem with device locks held, a writer may
  * be queued behind a reader which waits for one of them.
  */
-static int pci_bus_lock_changed(struct pci_bus *bus, struct pci_slot *slot)
+static int pci_bus_lock_changed(struct pci_bus *bus, struct pci_slot *slot,
+				bool added)
 {
 	int ret;
 
 	if (!down_read_trylock(&pci_bus_sem))
 		return -EBUSY;
-	ret = __pci_bus_lock_changed(bus, slot);
+	ret = __pci_bus_lock_changed(bus, slot, added);
 	up_read(&pci_bus_sem);
 
 	return ret;
+}
+
+/**
+ * pci_slot_lock_outdated - check whether a slot reset has to relock the slot
+ * @slot: PCI slot being reset
+ * @binding: the hotplug driver is binding drivers to devices in @slot
+ *
+ * A slot reset locks and saves the devices in the slot before it calls
+ * ->reset_slot(), which may wait for enumeration of the slot to finish.
+ * Check whether the current task locked @slot for a slot reset, but drivers
+ * are binding to devices in the slot, or the slot gained devices that the
+ * task didn't lock.  Resetting the slot would hit devices whose drivers are
+ * binding, or whose state the caller hasn't saved.  ->reset_slot() should
+ * then return -EAGAIN to have the caller relock the slot and retry.  If
+ * pci_bus_sem is contended, the slot counts as changed.
+ *
+ * Context: Called from ->reset_slot() with enumeration of the slot by the
+ * hotplug driver excluded.
+ *
+ * Return: true if the reset must not proceed.
+ */
+bool pci_slot_lock_outdated(struct pci_slot *slot, bool binding)
+{
+	struct pci_dev *bridge = slot->bus->self;
+
+	/* Not a slot reset by this task, e.g. a function reset */
+	if (!bridge || !pci_bus_dev_locked(bridge))
+		return false;
+
+	return binding || pci_bus_lock_changed(slot->bus, slot, false) != 0;
 }
 
 /*
@@ -5669,21 +5702,25 @@ static void pci_reset_devs_release(struct pci_reset_devs *rd)
 /*
  * Snapshot and lock the bridge above @bus and the devices on and below
  * @bus, or in @slot.  Relock if devices were added meanwhile, so that the
- * reset locks and saves them too.  Once the tries run out, a try reset
- * fails, while one that has to happen, e.g. for error recovery, goes
- * ahead, also if the last check couldn't be made because pci_bus_sem was
- * contended.  The callers keep @slot allocated.
+ * reset locks and saves them too.  A try reset of @slot, which saves and
+ * restores, also relocks while pci_bus_add_device() isn't done with devices
+ * in @slot: their adder may still configure them, e.g. assign their BARs,
+ * which restoring would undo.  @tries counts the attempts, also the
+ * caller's own retries.  Once they run out, a try reset fails, while one
+ * that has to happen, e.g. for error recovery, goes ahead, also if the
+ * last check couldn't be made because pci_bus_sem was contended; its
+ * ->reset_slot() may still refuse.  The callers keep @slot allocated.
  *
  * Return: the locked snapshot, or ERR_PTR(-EAGAIN) if @try and a device is
- * locked or keeps being added, -ENODEV if the bridge is being removed,
+ * locked or keeps changing, -ENODEV if the bridge is being removed,
  * -ENOMEM.
  */
 static struct pci_reset_devs *pci_reset_devs_acquire(struct pci_bus *bus,
 						     struct pci_slot *slot,
-						     bool try)
+						     bool try, int *tries)
 {
 	struct pci_reset_devs *rd;
-	int changed, tries = 0;
+	int changed;
 
 	/* Nothing else keeps @bus allocated while no device is locked */
 	pci_bus_get(bus);
@@ -5708,10 +5745,11 @@ static struct pci_reset_devs *pci_reset_devs_acquire(struct pci_bus *bus,
 			break;
 		}
 
-		changed = pci_bus_lock_changed(bus, slot);
+		/* Bus resets also run during enumeration, e.g. in vmd */
+		changed = pci_bus_lock_changed(bus, slot, try && slot);
 		if (!changed)
 			break;
-		if (++tries >= PCI_RESET_TRIES) {
+		if (++*tries >= PCI_RESET_TRIES) {
 			/* All devices in the snapshot are locked */
 			if (!try)
 				break;
@@ -5740,7 +5778,8 @@ static void pci_reset_devs_save(struct pci_reset_devs *rd)
 
 /*
  * Restore the locked devices below the bridge, top down.  Parent bridges
- * need to be restored before we can get to subordinate devices.
+ * need to be restored before we can get to subordinate devices.  Without
+ * @reset_type nothing was reset, so there is nothing to wait for.
  */
 static void pci_reset_devs_restore(struct pci_reset_devs *rd,
 				   char *reset_type)
@@ -5753,15 +5792,27 @@ static void pci_reset_devs_restore(struct pci_reset_devs *rd,
 		if (!pci_bus_dev_locked(dev))
 			continue;
 		pci_dev_restore(dev);
-		if (dev->subordinate)
+		if (dev->subordinate && reset_type)
 			pci_bridge_wait_for_secondary_bus(dev, reset_type);
 	}
+}
+
+/* Recheck a slot before retrying its reset, nothing is locked meanwhile */
+static bool pci_slot_still_resettable(struct pci_slot *slot)
+{
+	bool ret;
+
+	down_read(&pci_bus_sem);
+	ret = pci_slot_resettable(slot);
+	up_read(&pci_bus_sem);
+
+	return ret;
 }
 
 static int pci_slot_reset(struct pci_slot *slot, bool probe)
 {
 	struct pci_reset_devs *rd;
-	int rc;
+	int rc, tries = 0;
 
 	if (!slot || !pci_slot_resettable(slot))
 		return -ENOTTY;
@@ -5769,17 +5820,22 @@ static int pci_slot_reset(struct pci_slot *slot, bool probe)
 	if (probe)
 		return pci_reset_hotplug_slot(slot, probe);
 
-	rd = pci_reset_devs_acquire(slot->bus, slot, false);
-	if (IS_ERR(rd))
-		return PTR_ERR(rd);
+	for (;;) {
+		rd = pci_reset_devs_acquire(slot->bus, slot, false, &tries);
+		if (IS_ERR(rd))
+			return PTR_ERR(rd);
+		might_sleep();
+		rc = pci_reset_hotplug_slot(slot, probe);
+		pci_reset_devs_release(rd);
 
-	might_sleep();
+		/* Rather fail error recovery than hit devices that are binding */
+		if (rc != -EAGAIN || ++tries >= PCI_RESET_TRIES)
+			return rc;
 
-	rc = pci_reset_hotplug_slot(slot, probe);
-
-	pci_reset_devs_release(rd);
-
-	return rc;
+		msleep(PCI_RESET_RETRY_MS);
+		if (!pci_slot_still_resettable(slot))
+			return -ENOTTY;
+	}
 }
 
 /**
@@ -5812,29 +5868,37 @@ EXPORT_SYMBOL_GPL(pci_probe_reset_slot);
 static int pci_try_reset_slot(struct pci_slot *slot)
 {
 	struct pci_reset_devs *rd;
-	int rc;
+	int rc, tries = 0;
 
 	rc = pci_slot_reset(slot, PCI_RESET_PROBE);
 	if (rc)
 		return rc;
 
-	rd = pci_reset_devs_acquire(slot->bus, slot, true);
-	if (IS_ERR(rd))
-		return PTR_ERR(rd);
+	for (;;) {
+		rd = pci_reset_devs_acquire(slot->bus, slot, true, &tries);
+		if (IS_ERR(rd))
+			return PTR_ERR(rd);
 
-	pci_reset_devs_save(rd);
-	might_sleep();
-	rc = pci_reset_hotplug_slot(slot, PCI_RESET_DO_RESET);
-	pci_reset_devs_restore(rd, "slot reset");
-	pci_reset_devs_release(rd);
+		pci_reset_devs_save(rd);
+		might_sleep();
+		rc = pci_reset_hotplug_slot(slot, PCI_RESET_DO_RESET);
+		/* -EAGAIN: ->reset_slot() didn't reset */
+		pci_reset_devs_restore(rd, rc == -EAGAIN ? NULL : "slot reset");
+		pci_reset_devs_release(rd);
 
-	return rc;
+		if (rc != -EAGAIN || ++tries >= PCI_RESET_TRIES)
+			return rc;
+
+		msleep(PCI_RESET_RETRY_MS);
+		if (!pci_slot_still_resettable(slot))
+			return -ENOTTY;
+	}
 }
 
 static int pci_bus_reset(struct pci_bus *bus, bool probe)
 {
 	struct pci_reset_devs *rd;
-	int ret;
+	int ret, tries = 0;
 
 	if (!bus->self || !pci_bus_resettable(bus))
 		return -ENOTTY;
@@ -5842,7 +5906,7 @@ static int pci_bus_reset(struct pci_bus *bus, bool probe)
 	if (probe)
 		return 0;
 
-	rd = pci_reset_devs_acquire(bus, NULL, false);
+	rd = pci_reset_devs_acquire(bus, NULL, false, &tries);
 	if (IS_ERR(rd))
 		return PTR_ERR(rd);
 
@@ -5865,13 +5929,13 @@ static int pci_bus_reset(struct pci_bus *bus, bool probe)
 static int pci_try_reset_bus(struct pci_bus *bus)
 {
 	struct pci_reset_devs *rd;
-	int rc;
+	int rc, tries = 0;
 
 	rc = pci_bus_reset(bus, PCI_RESET_PROBE);
 	if (rc)
 		return rc;
 
-	rd = pci_reset_devs_acquire(bus, NULL, true);
+	rd = pci_reset_devs_acquire(bus, NULL, true, &tries);
 	if (IS_ERR(rd))
 		return PTR_ERR(rd);
 

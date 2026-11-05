@@ -406,7 +406,8 @@ int __pci_hp_initialize(struct hotplug_slot *slot, struct pci_bus *bus,
 		return PTR_ERR(pci_slot);
 
 	slot->pci_slot = pci_slot;
-	pci_slot->hotplug = slot;
+	/* Pairs with READ_ONCE() in pci_reset_hotplug_slot() */
+	smp_store_release(&pci_slot->hotplug, slot);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(__pci_hp_initialize);
