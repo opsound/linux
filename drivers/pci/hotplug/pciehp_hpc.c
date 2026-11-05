@@ -593,6 +593,32 @@ bool pciehp_device_replaced(struct controller *ctrl)
 	return false;
 }
 
+/**
+ * pciehp_ignore_reset_link_change() - ignore link changes caused by a reset
+ * @ctrl: PCIe hotplug controller
+ *
+ * Called by board_added() after a slot reset ran while it waited for
+ * pci_rescan_remove_lock, once the link check which followed has found the
+ * device.  Drop the link and presence events and the PCI_LINK_CHANGED flag
+ * left by the reset, so that a later genuine link change is not ignored.
+ *
+ * Context: Called with @ctrl->reset_lock held for reading.
+ */
+void pciehp_ignore_reset_link_change(struct controller *ctrl)
+{
+	struct pci_dev *pdev = ctrl_dev(ctrl);
+
+	if (!pciehp_poll_mode)
+		synchronize_hardirq(ctrl->pcie->irq);
+	atomic_and(~(PCI_EXP_SLTSTA_DLLSC | PCI_EXP_SLTSTA_PDC),
+		   &ctrl->pending_events);
+	if (pciehp_poll_mode)
+		pcie_capability_write_word(pdev, PCI_EXP_SLTSTA,
+					   PCI_EXP_SLTSTA_DLLSC |
+					   PCI_EXP_SLTSTA_PDC);
+	pci_hp_spurious_link_change(pdev);
+}
+
 static void pciehp_ignore_link_change(struct controller *ctrl,
 				      struct pci_dev *pdev, int irq,
 				      u16 ignored_events)
@@ -946,6 +972,7 @@ int pciehp_reset_slot(struct hotplug_slot *hotplug_slot, bool probe)
 		return 0;
 
 	down_write_nested(&ctrl->reset_lock, ctrl->depth);
+	ctrl->reset_count++;
 
 	pci_hp_ignore_link_change(pdev);
 

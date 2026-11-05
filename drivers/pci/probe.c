@@ -3524,6 +3524,12 @@ void pci_lock_rescan_remove(void)
 }
 EXPORT_SYMBOL_GPL(pci_lock_rescan_remove);
 
+/* Return 1 if pci_rescan_remove_lock was acquired, 0 on contention */
+int pci_rescan_remove_trylock(void)
+{
+	return mutex_trylock(&pci_rescan_remove_lock);
+}
+
 void pci_unlock_rescan_remove(void)
 {
 	mutex_unlock(&pci_rescan_remove_lock);

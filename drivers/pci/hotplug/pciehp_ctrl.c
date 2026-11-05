@@ -61,6 +61,7 @@ static void set_slot_off(struct controller *ctrl)
  */
 static int board_added(struct controller *ctrl)
 {
+	bool reset = false;
 	int retval = 0;
 	struct pci_bus *parent = ctrl->pcie->port->subordinate;
 
@@ -74,19 +75,28 @@ static int board_added(struct controller *ctrl)
 	pciehp_set_indicators(ctrl, PCI_EXP_SLTCTL_PWR_IND_BLINK,
 			      INDICATOR_NOOP);
 
-	/* Check link training status */
-	retval = pciehp_check_link_status(ctrl);
-	if (retval)
-		goto err_exit;
+	do {
+		/* Check link training status */
+		retval = pciehp_check_link_status(ctrl);
+		if (retval)
+			goto err_exit;
 
-	/* Check for a power fault */
-	if (ctrl->power_fault_detected || pciehp_query_power_fault(ctrl)) {
-		ctrl_err(ctrl, "Slot(%s): Power fault\n", slot_name(ctrl));
-		retval = -EIO;
-		goto err_exit;
-	}
+		if (reset)
+			pciehp_ignore_reset_link_change(ctrl);
 
-	retval = pciehp_configure_device(ctrl);
+		/* Check for a power fault */
+		if (ctrl->power_fault_detected ||
+		    pciehp_query_power_fault(ctrl)) {
+			ctrl_err(ctrl, "Slot(%s): Power fault\n",
+				 slot_name(ctrl));
+			retval = -EIO;
+			goto err_exit;
+		}
+
+		retval = pciehp_configure_device(ctrl);
+		reset = retval == -EAGAIN;
+	} while (reset);
+
 	if (retval) {
 		if (retval != -EEXIST) {
 			ctrl_err(ctrl, "Cannot add device at %04x:%02x:00\n",

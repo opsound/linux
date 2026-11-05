@@ -26,17 +26,35 @@
  * @ctrl: PCIe hotplug controller
  *
  * Enumerate PCI devices below a hotplug bridge and add them to the system.
- * Return 0 on success, %-EEXIST if the devices are already enumerated or
- * %-ENODEV if enumeration failed.
+ * Return 0 on success, %-EEXIST if the devices are already enumerated,
+ * %-ENODEV if enumeration failed or %-EAGAIN if the slot was reset since
+ * the caller checked the link.
+ *
+ * Context: Called with @ctrl->reset_lock held for reading.  Releases it
+ * during driver binding and while waiting for pci_rescan_remove_lock.
  */
 int pciehp_configure_device(struct controller *ctrl)
 {
 	struct pci_dev *dev;
 	struct pci_dev *bridge = ctrl->pcie->port;
 	struct pci_bus *parent = bridge->subordinate;
+	unsigned int resets = ctrl->reset_count;
 	int num, ret = 0;
 
-	pci_lock_rescan_remove();
+	/*
+	 * Don't block on pci_rescan_remove_lock with reset_lock held, as the
+	 * holder may reset this slot.  Wait for the holder with reset_lock
+	 * released instead.  A reset meanwhile invalidates the caller's link
+	 * check, so have it redo the check.
+	 */
+	while (!pci_rescan_remove_trylock()) {
+		up_read(&ctrl->reset_lock);
+		pci_lock_rescan_remove();
+		pci_unlock_rescan_remove();
+		down_read_nested(&ctrl->reset_lock, ctrl->depth);
+		if (ctrl->reset_count != resets)
+			return -EAGAIN;
+	}
 
 	dev = pci_get_slot(parent, PCI_DEVFN(0, 0));
 	if (dev) {
@@ -70,8 +88,7 @@ int pciehp_configure_device(struct controller *ctrl)
 
 	/*
 	 * Release reset_lock during driver binding to avoid AB-BA deadlock
-	 * with device_lock.  Re-acquire it only after releasing
-	 * pci_rescan_remove_lock, which is acquired with reset_lock held.
+	 * with device_lock.
 	 */
 	up_read(&ctrl->reset_lock);
 	pci_bus_add_devices(parent);

@@ -80,6 +80,8 @@ extern int pciehp_poll_time;
  *	Status register during a slot reset which may cause them to flap
  * @depth: Number of additional hotplug ports in the path to the root bus,
  *	used as lock subclass for @reset_lock
+ * @reset_count: number of slot resets, incremented with @reset_lock held
+ *	for writing
  * @ist_running: flag to keep user request waiting while IRQ thread is running
  * @request_result: result of last user request submitted to the IRQ thread
  * @requester: wait queue to wake up on completion of user request,
@@ -113,6 +115,7 @@ struct controller {
 	struct hotplug_slot hotplug_slot;	/* hotplug core interface */
 	struct rw_semaphore reset_lock;
 	unsigned int depth;
+	unsigned int reset_count;
 	unsigned int ist_running;
 	int request_result;
 	wait_queue_head_t requester;
@@ -186,6 +189,7 @@ int pciehp_query_power_fault(struct controller *ctrl);
 int pciehp_card_present(struct controller *ctrl);
 int pciehp_card_present_or_link_active(struct controller *ctrl);
 int pciehp_check_link_status(struct controller *ctrl);
+void pciehp_ignore_reset_link_change(struct controller *ctrl);
 int pciehp_check_link_active(struct controller *ctrl);
 bool pciehp_device_replaced(struct controller *ctrl);
 void pciehp_release_ctrl(struct controller *ctrl);
