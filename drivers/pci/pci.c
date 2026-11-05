@@ -5473,6 +5473,7 @@ static bool pci_slot_resettable(struct pci_slot *slot)
  * and restores.  Device removal unlinks devices from the bus lists without
  * their device locks, also while a reset waits for or holds them.  So the
  * reset walks this snapshot, which pins the devices, instead of the lists.
+ * Devices that are still being added are left out.
  */
 struct pci_reset_devs {
 	unsigned int nr;
@@ -5487,7 +5488,7 @@ static unsigned int pci_reset_devs_count(struct pci_bus *bus,
 	unsigned int nr = 0;
 
 	list_for_each_entry(dev, &bus->devices, bus_list) {
-		if (slot && dev->slot != slot)
+		if ((slot && dev->slot != slot) || pci_dev_is_adding(dev))
 			continue;
 		nr++;
 		if (dev->subordinate)
@@ -5503,7 +5504,7 @@ static void pci_reset_devs_fill(struct pci_reset_devs *rd,
 	struct pci_dev *dev;
 
 	list_for_each_entry(dev, &bus->devices, bus_list) {
-		if (slot && dev->slot != slot)
+		if ((slot && dev->slot != slot) || pci_dev_is_adding(dev))
 			continue;
 		/* Devices that joined @slot since counting are left out */
 		if (rd->nr == rd->max)

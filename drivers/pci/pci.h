@@ -824,6 +824,7 @@ static inline int pci_dev_set_disconnected(struct pci_dev *dev, void *unused)
 #define PCI_LINK_CHANGING 5
 #define PCI_LINK_LBMS_SEEN	6
 #define PCI_DEV_ALLOW_BINDING 7
+#define PCI_DEV_ADDING 8
 
 static inline void pci_dev_assign_added(struct pci_dev *dev)
 {
@@ -840,6 +841,11 @@ static inline bool pci_dev_test_and_clear_added(struct pci_dev *dev)
 static inline bool pci_dev_is_added(const struct pci_dev *dev)
 {
 	return test_bit(PCI_DEV_ADDED, &dev->priv_flags);
+}
+
+static inline bool pci_dev_is_adding(const struct pci_dev *dev)
+{
+	return test_bit(PCI_DEV_ADDING, &dev->priv_flags);
 }
 
 static inline bool pci_dev_is_removed(struct pci_dev *dev)

@@ -2761,7 +2761,13 @@ void pci_device_add(struct pci_dev *dev, struct pci_bus *bus)
 	/*
 	 * Add the device to our list of discovered devices
 	 * and the bus list for fixup functions, etc.
+	 *
+	 * Keep resets away from the device until pci_device_add() is done:
+	 * device_add() takes its device lock, and the caller may hold a lock
+	 * that a reset holding the device lock waits for, e.g. pciehp's
+	 * reset_lock.
 	 */
+	set_bit(PCI_DEV_ADDING, &dev->priv_flags);
 	down_write(&pci_bus_sem);
 	list_add_tail(&dev->bus_list, &bus->devices);
 	up_write(&pci_bus_sem);
@@ -2782,6 +2788,8 @@ void pci_device_add(struct pci_dev *dev, struct pci_bus *bus)
 	pci_npem_create(dev);
 
 	pci_doe_sysfs_init(dev);
+
+	clear_bit(PCI_DEV_ADDING, &dev->priv_flags);
 }
 
 struct pci_dev *pci_scan_single_device(struct pci_bus *bus, int devfn)
