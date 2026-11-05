@@ -5416,96 +5416,36 @@ static bool pci_bus_resettable(struct pci_bus *bus)
 	return true;
 }
 
-static void pci_bus_lock(struct pci_bus *bus);
-static void pci_bus_unlock(struct pci_bus *bus);
-static int pci_bus_trylock(struct pci_bus *bus);
-
-/* Lock devices from the top of the tree down */
-static void __pci_bus_lock(struct pci_bus *bus, struct pci_slot *slot)
+/*
+ * Record which task locked each device for a bus or slot reset, and only
+ * save, restore and unlock the devices that the current task locked.
+ * Device locks don't nest, so a device is held by at most one bus or slot
+ * reset, and a task holds at most one at a time.
+ */
+static void pci_bus_dev_lock(struct pci_dev *dev)
 {
-	struct pci_dev *dev, *bridge = bus->self;
-
-	if (bridge)
-		pci_dev_lock(bridge);
-
-	list_for_each_entry(dev, &bus->devices, bus_list) {
-		if (slot && (!dev->slot || dev->slot != slot))
-			continue;
-		if (dev->subordinate)
-			pci_bus_lock(dev->subordinate);
-		else
-			pci_dev_lock(dev);
-	}
+	pci_dev_lock(dev);
+	WRITE_ONCE(dev->bus_locker, current);
 }
 
-/* Unlock devices from the bottom of the tree up */
-static void __pci_bus_unlock(struct pci_bus *bus, struct pci_slot *slot)
+static int pci_bus_dev_trylock(struct pci_dev *dev)
 {
-	struct pci_dev *dev, *bridge = bus->self;
-
-	list_for_each_entry(dev, &bus->devices, bus_list) {
-		if (slot && (!dev->slot || dev->slot != slot))
-			continue;
-		if (dev->subordinate)
-			pci_bus_unlock(dev->subordinate);
-		else
-			pci_dev_unlock(dev);
-	}
-
-	if (bridge)
-		pci_dev_unlock(bridge);
-}
-
-/* Return 1 on successful lock, 0 on contention */
-static int __pci_bus_trylock(struct pci_bus *bus, struct pci_slot *slot)
-{
-	struct pci_dev *dev, *bridge = bus->self;
-
-	if (bridge && !pci_dev_trylock(bridge))
+	if (!pci_dev_trylock(dev))
 		return 0;
 
-	list_for_each_entry(dev, &bus->devices, bus_list) {
-		if (slot && (!dev->slot || dev->slot != slot))
-			continue;
-		if (dev->subordinate) {
-			if (!pci_bus_trylock(dev->subordinate))
-				goto unlock;
-		} else if (!pci_dev_trylock(dev))
-			goto unlock;
-	}
+	WRITE_ONCE(dev->bus_locker, current);
 	return 1;
-
-unlock:
-	list_for_each_entry_continue_reverse(dev, &bus->devices, bus_list) {
-		if (slot && (!dev->slot || dev->slot != slot))
-			continue;
-		if (dev->subordinate)
-			pci_bus_unlock(dev->subordinate);
-		else
-			pci_dev_unlock(dev);
-	}
-
-	if (bridge)
-		pci_dev_unlock(bridge);
-	return 0;
 }
 
-/* Lock devices from the top of the tree down */
-static void pci_bus_lock(struct pci_bus *bus)
+static bool pci_bus_dev_locked(struct pci_dev *dev)
 {
-	__pci_bus_lock(bus, NULL);
+	return dev && READ_ONCE(dev->bus_locker) == current;
 }
 
-/* Unlock devices from the bottom of the tree up */
-static void pci_bus_unlock(struct pci_bus *bus)
+static void pci_bus_dev_unlock(struct pci_dev *dev)
 {
-	__pci_bus_unlock(bus, NULL);
-}
-
-/* Return 1 on successful lock, 0 on contention */
-static int pci_bus_trylock(struct pci_bus *bus)
-{
-	return __pci_bus_trylock(bus, NULL);
+	WRITE_ONCE(dev->bus_locker, NULL);
+	pci_dev_unlock(dev);
 }
 
 /* Do any devices on or below this slot prevent a bus reset? */
@@ -5527,110 +5467,216 @@ static bool pci_slot_resettable(struct pci_slot *slot)
 	return true;
 }
 
-/* Lock devices from the top of the tree down */
-static void pci_slot_lock(struct pci_slot *slot)
+/*
+ * The bridge above a bus and the devices on and below the bus, or in a
+ * slot on it, top down: the devices that a bus or slot reset locks, saves
+ * and restores.  Device removal unlinks devices from the bus lists without
+ * their device locks, also while a reset waits for or holds them.  So the
+ * reset walks this snapshot, which pins the devices, instead of the lists.
+ */
+struct pci_reset_devs {
+	unsigned int nr;
+	unsigned int max;
+	struct pci_dev *dev[] __counted_by(max);
+};
+
+static unsigned int pci_reset_devs_count(struct pci_bus *bus,
+					 struct pci_slot *slot)
 {
-	__pci_bus_lock(slot->bus, slot);
+	struct pci_dev *dev;
+	unsigned int nr = 0;
+
+	list_for_each_entry(dev, &bus->devices, bus_list) {
+		if (slot && dev->slot != slot)
+			continue;
+		nr++;
+		if (dev->subordinate)
+			nr += pci_reset_devs_count(dev->subordinate, NULL);
+	}
+
+	return nr;
 }
 
-/* Unlock devices from the bottom of the tree up */
-static void pci_slot_unlock(struct pci_slot *slot)
+static void pci_reset_devs_fill(struct pci_reset_devs *rd,
+				struct pci_bus *bus, struct pci_slot *slot)
 {
-	__pci_bus_unlock(slot->bus, slot);
+	struct pci_dev *dev;
+
+	list_for_each_entry(dev, &bus->devices, bus_list) {
+		if (slot && dev->slot != slot)
+			continue;
+		/* Devices that joined @slot since counting are left out */
+		if (rd->nr == rd->max)
+			return;
+		rd->dev[rd->nr++] = pci_dev_get(dev);
+		if (dev->subordinate)
+			pci_reset_devs_fill(rd, dev->subordinate, NULL);
+	}
+}
+
+static struct pci_reset_devs *pci_reset_devs_get(struct pci_bus *bus,
+						 struct pci_slot *slot)
+{
+	struct pci_reset_devs *rd;
+	unsigned int max;
+
+	down_read(&pci_bus_sem);
+	max = 1 + pci_reset_devs_count(bus, slot);
+	rd = kzalloc(struct_size(rd, dev, max), GFP_KERNEL);
+	if (rd) {
+		rd->max = max;
+		rd->dev[rd->nr++] = pci_dev_get(bus->self);
+		pci_reset_devs_fill(rd, bus, slot);
+	}
+	up_read(&pci_bus_sem);
+
+	return rd;
+}
+
+static void pci_reset_devs_put(struct pci_reset_devs *rd)
+{
+	unsigned int i;
+
+	for (i = 0; i < rd->nr; i++)
+		pci_dev_put(rd->dev[i]);
+	kfree(rd);
+}
+
+/* Leave devices alone whose removal began, they're unlinked at any time */
+static void pci_reset_devs_drop_removed(struct pci_dev *dev)
+{
+	if (pci_dev_is_removed(dev))
+		pci_bus_dev_unlock(dev);
+}
+
+/* Lock devices from the top of the tree down */
+static void pci_reset_devs_lock(struct pci_reset_devs *rd)
+{
+	unsigned int i;
+
+	for (i = 0; i < rd->nr; i++) {
+		if (!rd->dev[i])
+			continue;
+		pci_bus_dev_lock(rd->dev[i]);
+		pci_reset_devs_drop_removed(rd->dev[i]);
+	}
+}
+
+/* Unlock the first @nr devices, from the bottom of the tree up */
+static void pci_reset_devs_unlock(struct pci_reset_devs *rd, unsigned int nr)
+{
+	while (nr--)
+		if (rd->dev[nr] && pci_bus_dev_locked(rd->dev[nr]))
+			pci_bus_dev_unlock(rd->dev[nr]);
 }
 
 /* Return 1 on successful lock, 0 on contention */
-static int pci_slot_trylock(struct pci_slot *slot)
+static int pci_reset_devs_trylock(struct pci_reset_devs *rd)
 {
-	return __pci_bus_trylock(slot->bus, slot);
-}
+	unsigned int i;
 
-/*
- * Save and disable devices from the top of the tree down while holding
- * the @dev mutex lock for the entire tree.
- */
-static void pci_bus_save_and_disable_locked(struct pci_bus *bus)
-{
-	struct pci_dev *dev;
-
-	list_for_each_entry(dev, &bus->devices, bus_list) {
-		pci_dev_save_and_disable(dev);
-		if (dev->subordinate)
-			pci_bus_save_and_disable_locked(dev->subordinate);
-	}
-}
-
-/*
- * Restore devices from top of the tree down while holding @dev mutex lock
- * for the entire tree.  Parent bridges need to be restored before we can
- * get to subordinate devices.
- */
-static void pci_bus_restore_locked(struct pci_bus *bus)
-{
-	struct pci_dev *dev;
-
-	list_for_each_entry(dev, &bus->devices, bus_list) {
-		pci_dev_restore(dev);
-		if (dev->subordinate) {
-			pci_bridge_wait_for_secondary_bus(dev, "bus reset");
-			pci_bus_restore_locked(dev->subordinate);
-		}
-	}
-}
-
-/*
- * Save and disable devices from the top of the tree down while holding
- * the @dev mutex lock for the entire tree.
- */
-static void pci_slot_save_and_disable_locked(struct pci_slot *slot)
-{
-	struct pci_dev *dev;
-
-	list_for_each_entry(dev, &slot->bus->devices, bus_list) {
-		if (!dev->slot || dev->slot != slot)
+	for (i = 0; i < rd->nr; i++) {
+		if (!rd->dev[i])
 			continue;
-		pci_dev_save_and_disable(dev);
-		if (dev->subordinate)
-			pci_bus_save_and_disable_locked(dev->subordinate);
+		if (!pci_bus_dev_trylock(rd->dev[i])) {
+			pci_reset_devs_unlock(rd, i);
+			return 0;
+		}
+		pci_reset_devs_drop_removed(rd->dev[i]);
 	}
+
+	return 1;
+}
+
+static void pci_reset_devs_release(struct pci_reset_devs *rd)
+{
+	pci_reset_devs_unlock(rd, rd->nr);
+	pci_reset_devs_put(rd);
 }
 
 /*
- * Restore devices from top of the tree down while holding @dev mutex lock
- * for the entire tree.  Parent bridges need to be restored before we can
- * get to subordinate devices.
+ * Snapshot and lock the bridge above @bus and the devices on and below
+ * @bus, or in @slot.  Devices added while the reset waits for a lock are
+ * left alone.
+ *
+ * Return: the locked snapshot, or ERR_PTR(-EAGAIN) if @try and a device is
+ * locked, -ENODEV if the bridge is being removed, -ENOMEM.
  */
-static void pci_slot_restore_locked(struct pci_slot *slot)
+static struct pci_reset_devs *pci_reset_devs_acquire(struct pci_bus *bus,
+						     struct pci_slot *slot,
+						     bool try)
+{
+	struct pci_reset_devs *rd;
+
+	rd = pci_reset_devs_get(bus, slot);
+	if (!rd)
+		return ERR_PTR(-ENOMEM);
+
+	if (!try) {
+		pci_reset_devs_lock(rd);
+	} else if (!pci_reset_devs_trylock(rd)) {
+		pci_reset_devs_put(rd);
+		return ERR_PTR(-EAGAIN);
+	}
+
+	if (rd->dev[0] && !pci_bus_dev_locked(rd->dev[0])) {
+		pci_reset_devs_release(rd);
+		return ERR_PTR(-ENODEV);
+	}
+
+	return rd;
+}
+
+/* Save and disable the locked devices below the bridge, top down */
+static void pci_reset_devs_save(struct pci_reset_devs *rd)
+{
+	unsigned int i;
+
+	for (i = 1; i < rd->nr; i++)
+		if (pci_bus_dev_locked(rd->dev[i]))
+			pci_dev_save_and_disable(rd->dev[i]);
+}
+
+/*
+ * Restore the locked devices below the bridge, top down.  Parent bridges
+ * need to be restored before we can get to subordinate devices.
+ */
+static void pci_reset_devs_restore(struct pci_reset_devs *rd,
+				   char *reset_type)
 {
 	struct pci_dev *dev;
+	unsigned int i;
 
-	list_for_each_entry(dev, &slot->bus->devices, bus_list) {
-		if (!dev->slot || dev->slot != slot)
+	for (i = 1; i < rd->nr; i++) {
+		dev = rd->dev[i];
+		if (!pci_bus_dev_locked(dev))
 			continue;
 		pci_dev_restore(dev);
-		if (dev->subordinate) {
-			pci_bridge_wait_for_secondary_bus(dev, "slot reset");
-			pci_bus_restore_locked(dev->subordinate);
-		}
+		if (dev->subordinate)
+			pci_bridge_wait_for_secondary_bus(dev, reset_type);
 	}
 }
 
 static int pci_slot_reset(struct pci_slot *slot, bool probe)
 {
+	struct pci_reset_devs *rd;
 	int rc;
 
 	if (!slot || !pci_slot_resettable(slot))
 		return -ENOTTY;
 
-	if (!probe)
-		pci_slot_lock(slot);
+	if (probe)
+		return pci_reset_hotplug_slot(slot->hotplug, probe);
+
+	rd = pci_reset_devs_acquire(slot->bus, slot, false);
+	if (IS_ERR(rd))
+		return PTR_ERR(rd);
 
 	might_sleep();
 
 	rc = pci_reset_hotplug_slot(slot->hotplug, probe);
 
-	if (!probe)
-		pci_slot_unlock(slot);
+	pci_reset_devs_release(rd);
 
 	return rc;
 }
@@ -5664,26 +5710,29 @@ EXPORT_SYMBOL_GPL(pci_probe_reset_slot);
  */
 static int pci_try_reset_slot(struct pci_slot *slot)
 {
+	struct pci_reset_devs *rd;
 	int rc;
 
 	rc = pci_slot_reset(slot, PCI_RESET_PROBE);
 	if (rc)
 		return rc;
 
-	if (pci_slot_trylock(slot)) {
-		pci_slot_save_and_disable_locked(slot);
-		might_sleep();
-		rc = pci_reset_hotplug_slot(slot->hotplug, PCI_RESET_DO_RESET);
-		pci_slot_restore_locked(slot);
-		pci_slot_unlock(slot);
-	} else
-		rc = -EAGAIN;
+	rd = pci_reset_devs_acquire(slot->bus, slot, true);
+	if (IS_ERR(rd))
+		return PTR_ERR(rd);
+
+	pci_reset_devs_save(rd);
+	might_sleep();
+	rc = pci_reset_hotplug_slot(slot->hotplug, PCI_RESET_DO_RESET);
+	pci_reset_devs_restore(rd, "slot reset");
+	pci_reset_devs_release(rd);
 
 	return rc;
 }
 
 static int pci_bus_reset(struct pci_bus *bus, bool probe)
 {
+	struct pci_reset_devs *rd;
 	int ret;
 
 	if (!bus->self || !pci_bus_resettable(bus))
@@ -5692,13 +5741,15 @@ static int pci_bus_reset(struct pci_bus *bus, bool probe)
 	if (probe)
 		return 0;
 
-	pci_bus_lock(bus);
+	rd = pci_reset_devs_acquire(bus, NULL, false);
+	if (IS_ERR(rd))
+		return PTR_ERR(rd);
 
 	might_sleep();
 
 	ret = pci_bridge_secondary_bus_reset(bus->self);
 
-	pci_bus_unlock(bus);
+	pci_reset_devs_release(rd);
 
 	return ret;
 }
@@ -5711,20 +5762,22 @@ static int pci_bus_reset(struct pci_bus *bus, bool probe)
  */
 static int pci_try_reset_bus(struct pci_bus *bus)
 {
+	struct pci_reset_devs *rd;
 	int rc;
 
 	rc = pci_bus_reset(bus, PCI_RESET_PROBE);
 	if (rc)
 		return rc;
 
-	if (pci_bus_trylock(bus)) {
-		pci_bus_save_and_disable_locked(bus);
-		might_sleep();
-		rc = pci_bridge_secondary_bus_reset(bus->self);
-		pci_bus_restore_locked(bus);
-		pci_bus_unlock(bus);
-	} else
-		rc = -EAGAIN;
+	rd = pci_reset_devs_acquire(bus, NULL, true);
+	if (IS_ERR(rd))
+		return PTR_ERR(rd);
+
+	pci_reset_devs_save(rd);
+	might_sleep();
+	rc = pci_bridge_secondary_bus_reset(bus->self);
+	pci_reset_devs_restore(rd, "bus reset");
+	pci_reset_devs_release(rd);
 
 	return rc;
 }

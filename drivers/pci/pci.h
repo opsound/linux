@@ -842,6 +842,11 @@ static inline bool pci_dev_is_added(const struct pci_dev *dev)
 	return test_bit(PCI_DEV_ADDED, &dev->priv_flags);
 }
 
+static inline bool pci_dev_is_removed(struct pci_dev *dev)
+{
+	return test_bit(PCI_DEV_REMOVED, &dev->priv_flags);
+}
+
 static inline bool pci_dev_test_and_set_removed(struct pci_dev *dev)
 {
 	return test_and_set_bit(PCI_DEV_REMOVED, &dev->priv_flags);

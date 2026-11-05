@@ -588,6 +588,7 @@ struct pci_dev {
 	phys_addr_t	rom;		/* Physical address if not from BAR */
 	size_t		romlen;		/* Length if not from BAR */
 	unsigned long	priv_flags;	/* Private flags for the PCI driver */
+	struct task_struct *bus_locker;	/* Holder for a bus or slot reset */
 
 	/* These methods index pci_reset_fn_methods[] */
 	u8 reset_methods[PCI_NUM_RESET_METHODS]; /* In priority order */
