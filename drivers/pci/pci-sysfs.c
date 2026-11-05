@@ -515,13 +515,25 @@ static struct device_attribute dev_attr_dev_rescan = __ATTR(rescan, 0200, NULL,
 static ssize_t remove_store(struct device *dev, struct device_attribute *attr,
 			    const char *buf, size_t count)
 {
+	struct pci_dev *pdev = to_pci_dev(dev);
 	unsigned long val;
 
 	if (kstrtoul(buf, 0, &val) < 0)
 		return -EINVAL;
 
-	if (val && device_remove_file_self(dev, attr))
-		pci_stop_and_remove_bus_device_locked(to_pci_dev(dev));
+	if (!val)
+		return count;
+
+	/* Once the file is gone, nothing else keeps pdev from being freed */
+	pci_dev_get(pdev);
+	if (device_remove_file_self(dev, attr)) {
+		pci_lock_rescan_remove();
+		/* Another remover may have removed it meanwhile */
+		if (!pci_dev_is_removed(pdev))
+			pci_stop_and_remove_bus_device(pdev);
+		pci_unlock_rescan_remove();
+	}
+	pci_dev_put(pdev);
 	return count;
 }
 static DEVICE_ATTR_IGNORE_LOCKDEP(remove, 0220, NULL,
