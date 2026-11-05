@@ -4975,19 +4975,44 @@ static int pci_parent_bus_reset(struct pci_dev *dev, bool probe)
 	return pci_bridge_secondary_bus_reset(dev->bus->self);
 }
 
-static int pci_reset_hotplug_slot(struct hotplug_slot *hotplug, bool probe)
+/*
+ * ->reset_slot() can be called without the hotplug driver's device locked,
+ * e.g. for a function reset.  Count the calls in flight, so that
+ * pci_slot_unset_hotplug() can wait for them before the hotplug driver
+ * frees its hotplug_slot.
+ */
+static int pci_reset_hotplug_slot(struct pci_slot *slot, bool probe)
 {
+	struct hotplug_slot *hotplug;
 	int rc = -ENOTTY;
 
+	atomic_inc(&slot->hotplug_users);
+	smp_mb__after_atomic();	/* Pairs with smp_mb() in pci_slot_unset_hotplug() */
+	hotplug = READ_ONCE(slot->hotplug);
 	if (!hotplug || !try_module_get(hotplug->owner))
-		return rc;
+		goto out;
 
 	if (hotplug->ops->reset_slot)
 		rc = hotplug->ops->reset_slot(hotplug, probe);
 
 	module_put(hotplug->owner);
-
+out:
+	if (atomic_dec_and_test(&slot->hotplug_users))
+		wake_up_var(&slot->hotplug_users);
 	return rc;
+}
+
+/**
+ * pci_slot_unset_hotplug - detach a hotplug driver from a PCI slot
+ * @slot: PCI slot
+ *
+ * Clear @slot->hotplug and wait for ->reset_slot() calls in flight.
+ */
+void pci_slot_unset_hotplug(struct pci_slot *slot)
+{
+	WRITE_ONCE(slot->hotplug, NULL);
+	smp_mb();	/* Pairs with smp_mb__after_atomic() in pci_reset_hotplug_slot() */
+	wait_var_event(&slot->hotplug_users, !atomic_read(&slot->hotplug_users));
 }
 
 static int pci_dev_reset_slot_function(struct pci_dev *dev, bool probe)
@@ -4997,7 +5022,7 @@ static int pci_dev_reset_slot_function(struct pci_dev *dev, bool probe)
 	    (dev->multifunction && !dev->slot->per_func_slot))
 		return -ENOTTY;
 
-	return pci_reset_hotplug_slot(dev->slot->hotplug, probe);
+	return pci_reset_hotplug_slot(dev->slot, probe);
 }
 
 static u16 cxl_port_dvsec(struct pci_dev *dev)
@@ -5667,7 +5692,7 @@ static int pci_slot_reset(struct pci_slot *slot, bool probe)
 		return -ENOTTY;
 
 	if (probe)
-		return pci_reset_hotplug_slot(slot->hotplug, probe);
+		return pci_reset_hotplug_slot(slot, probe);
 
 	rd = pci_reset_devs_acquire(slot->bus, slot, false);
 	if (IS_ERR(rd))
@@ -5675,7 +5700,7 @@ static int pci_slot_reset(struct pci_slot *slot, bool probe)
 
 	might_sleep();
 
-	rc = pci_reset_hotplug_slot(slot->hotplug, probe);
+	rc = pci_reset_hotplug_slot(slot, probe);
 
 	pci_reset_devs_release(rd);
 
@@ -5724,7 +5749,7 @@ static int pci_try_reset_slot(struct pci_slot *slot)
 
 	pci_reset_devs_save(rd);
 	might_sleep();
-	rc = pci_reset_hotplug_slot(slot->hotplug, PCI_RESET_DO_RESET);
+	rc = pci_reset_hotplug_slot(slot, PCI_RESET_DO_RESET);
 	pci_reset_devs_restore(rd, "slot reset");
 	pci_reset_devs_release(rd);
 

@@ -476,14 +476,15 @@ EXPORT_SYMBOL_GPL(pci_hp_del);
  * Destroy a PCI slot used by a hotplug driver.  Once this has been called,
  * the driver may no longer invoke hotplug_slot_name() to get the slot's
  * unique name.  The driver no longer needs to handle a ->reset_slot callback
- * from this point on.
+ * from this point on:  This waits for calls in flight, so the caller must not
+ * hold locks that ->reset_slot acquires.
  */
 void pci_hp_destroy(struct hotplug_slot *slot)
 {
 	struct pci_slot *pci_slot = slot->pci_slot;
 
+	pci_slot_unset_hotplug(pci_slot);
 	slot->pci_slot = NULL;
-	pci_slot->hotplug = NULL;
 	pci_destroy_slot(pci_slot);
 }
 EXPORT_SYMBOL_GPL(pci_hp_destroy);

@@ -126,6 +126,8 @@ extern bool pci_early_dump;
 extern struct mutex pci_rescan_remove_lock;
 int pci_rescan_remove_trylock(void);
 
+void pci_slot_unset_hotplug(struct pci_slot *slot);
+
 bool pcie_cap_has_lnkctl(const struct pci_dev *dev);
 bool pcie_cap_has_lnkctl2(const struct pci_dev *dev);
 bool pcie_cap_has_rtctl(const struct pci_dev *dev);
