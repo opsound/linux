@@ -5823,7 +5823,7 @@ static int pci_try_reset_bus(struct pci_bus *bus)
 static int pci_reset_bridge(struct pci_dev *bridge, bool restore)
 {
 	struct pci_bus *bus = bridge->subordinate;
-	struct pci_slot *slot;
+	struct pci_slot *slot, *next;
 	int ret = 0;
 
 	if (!bus)
@@ -5837,14 +5837,29 @@ static int pci_reset_bridge(struct pci_dev *bridge, bool restore)
 		if (pci_probe_reset_slot(slot))
 			goto bus_reset;
 
-	list_for_each_entry(slot, &bus->slots, list) {
+	/*
+	 * Don't hold pci_slot_mutex across the reset.  It nests inside device
+	 * locks and pciehp's reset_lock, both of which a slot reset acquires.
+	 * The reference keeps the slot, and its place on bus->slots, valid.
+	 */
+	slot = list_first_entry(&bus->slots, struct pci_slot, list);
+	kobject_get(&slot->kobj);
+	while (slot) {
+		mutex_unlock(&pci_slot_mutex);
 		if (restore)
 			ret = pci_try_reset_slot(slot);
 		else
 			ret = pci_slot_reset(slot, PCI_RESET_DO_RESET);
+		mutex_lock(&pci_slot_mutex);
 
-		if (ret)
-			break;
+		next = NULL;
+		if (!ret && !list_is_last(&slot->list, &bus->slots)) {
+			next = list_next_entry(slot, list);
+			kobject_get(&next->kobj);
+		}
+		/* The final put unlinks the slot, which needs pci_slot_mutex */
+		kobject_put(&slot->kobj);
+		slot = next;
 	}
 
 	mutex_unlock(&pci_slot_mutex);
