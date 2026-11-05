@@ -72,3 +72,6 @@ shpchp-objs		:=	shpchp_core.o	\
 				shpchp_pci.o	\
 				shpchp_sysfs.o	\
 				shpchp_hpc.o
+
+# TEST ONLY (pciehp-reset-lab)
+pciehp-objs += pciehp_test_knobs.o

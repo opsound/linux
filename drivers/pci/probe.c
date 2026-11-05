@@ -26,6 +26,8 @@
 #include <trace/events/pci.h>
 #include "pci.h"
 
+void pcitest_add_delay(struct pci_dev *dev);	/* TEST ONLY (pciehp-reset-lab) */
+
 static struct resource busn_resource = {
 	.name	= "PCI busn",
 	.start	= 0,
@@ -2771,6 +2773,7 @@ void pci_device_add(struct pci_dev *dev, struct pci_bus *bus)
 	down_write(&pci_bus_sem);
 	list_add_tail(&dev->bus_list, &bus->devices);
 	up_write(&pci_bus_sem);
+	pcitest_add_delay(dev);	/* TEST ONLY (pciehp-reset-lab) */
 
 	ret = pcibios_device_add(dev);
 	WARN_ON(ret < 0);
