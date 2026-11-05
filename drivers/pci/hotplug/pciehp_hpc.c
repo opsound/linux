@@ -564,15 +564,14 @@ void pciehp_power_off_slot(struct controller *ctrl)
 		 PCI_EXP_SLTCTL_PWR_OFF);
 }
 
-bool pciehp_device_replaced(struct controller *ctrl)
+static bool __pciehp_device_replaced(struct controller *ctrl,
+				     struct pci_dev *pdev)
 {
-	struct pci_dev *pdev __free(pci_dev_put) = NULL;
 	u32 reg;
 
 	if (pci_dev_is_disconnected(ctrl->pcie->port))
 		return false;
 
-	pdev = pci_get_slot(ctrl->pcie->port->subordinate, PCI_DEVFN(0, 0));
 	if (!pdev)
 		return true;
 
@@ -591,6 +590,14 @@ bool pciehp_device_replaced(struct controller *ctrl)
 		return true;
 
 	return false;
+}
+
+bool pciehp_device_replaced(struct controller *ctrl)
+{
+	struct pci_dev *pdev __free(pci_dev_put) =
+		pci_get_slot(ctrl->pcie->port->subordinate, PCI_DEVFN(0, 0));
+
+	return __pciehp_device_replaced(ctrl, pdev);
 }
 
 /**
@@ -623,6 +630,8 @@ static void pciehp_ignore_link_change(struct controller *ctrl,
 				      struct pci_dev *pdev, int irq,
 				      u16 ignored_events)
 {
+	struct pci_dev *dev __free(pci_dev_put) = NULL;
+
 	/*
 	 * Ignore link changes which occurred while waiting for DPC recovery.
 	 * Could be several if DPC triggered multiple times consecutively.
@@ -638,10 +647,14 @@ static void pciehp_ignore_link_change(struct controller *ctrl,
 	/*
 	 * If the link is unexpectedly down after successful recovery,
 	 * the corresponding link change may have been ignored above.
-	 * Synthesize it to ensure that it is acted on.
+	 * Synthesize it to ensure that it is acted on.  Look up the device
+	 * before acquiring reset_lock:  pci_bus_sem may be held by a task
+	 * waiting for a device_lock whose holder waits for a slot reset.
 	 */
+	dev = pci_get_slot(pdev->subordinate, PCI_DEVFN(0, 0));
 	down_read_nested(&ctrl->reset_lock, ctrl->depth);
-	if (!pciehp_check_link_active(ctrl) || pciehp_device_replaced(ctrl))
+	if (!pciehp_check_link_active(ctrl) ||
+	    __pciehp_device_replaced(ctrl, dev))
 		pciehp_request(ctrl, ignored_events);
 	up_read(&ctrl->reset_lock);
 }
